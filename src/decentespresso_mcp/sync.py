@@ -12,8 +12,9 @@ the first old entry would never see it. The full list costs two requests on
 the local network for 168 shots - and in exchange the sync also finds changes
 made after the fact.
 
-Backfill and incremental run are thus the same algorithm; ``full=True`` merely
-forces every shot to be fetched again.
+Backfill and incremental run are thus the same algorithm; ``full`` only
+chooses the label. It once forced every shot to be fetched again, which made a
+first backfill of more than one run's worth impossible to finish (SPEC §6).
 
 TABLET OFF. The tablet is not always on. If it cannot be reached that is not
 an error state but the normal case between two coffees: the run ends with
@@ -24,6 +25,7 @@ error list.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from dataclasses import asdict, dataclass, field
@@ -33,30 +35,81 @@ from typing import Any
 from .config import Config
 from .db import Database, utc_now_iso
 from .decaid_client import (
+    ENJOYMENT_0_10_FROM_BUILD,
     MAX_PAGE_SIZE,
+    AlreadyExists,
     DecaidClient,
     DecaidError,
     DecaidUnreachable,
+    Protected,
     ShotNotFound,
 )
 from .decaid_mapping import (
+    SCALE_10,
+    SCALE_100,
+    annotation_fields,
     batch_row_from_decaid,
     bean_row_from_decaid,
     series_rows_from_decaid,
     shot_row_from_decaid,
 )
 from .decaid_profile import profile_version
+from .freezing import events_of, mirrored_events
 from .guards import run_rules
 from .metrics import metrics_for_shot, warm_metrics_cache
 from .notify import send as notify
+from .profile_forge import (
+    MARKER,
+    MARKER_KEY,
+    OVERRIDES,
+    TITLE_SEPARATOR,
+    apply_overrides,
+    changes_brewing,
+    check_title,
+    default_title,
+    is_default,
+    made_here,
+    resolve_profile,
+    running_profile,
+    same_brew,
+)
+from .recipes import recipe_batch, recipe_workflow
+from .upload_watch import POLL_SECONDS, WATCH_SECONDS, newest, outcome
+from .writes import ValidationError
 
 log = logging.getLogger(__name__)
+
+#: Key under which a workflow write hands the profile upload's outcome to the
+#: tool (T47). Popped there; never part of a diff.
+MACHINE_UPLOAD = "_machine_upload"
+
+UPLOAD_NOTES = {
+    "failed_retrying": (
+        "Decaid could not upload the profile to the DE1 and retries on its own "
+        "after 3, 10 and 30 s. Do not start the shot until the tablet preview "
+        "shows the new curve."
+    ),
+    "pending_connection": (
+        "The DE1 is not connected. Decaid uploads the profile once it connects; "
+        "until then the machine keeps the profile it had."
+    ),
+    "unconfirmed": (
+        "The upload runs over Bluetooth for several seconds and nothing "
+        "confirmed it yet. Do not start the shot until the tablet preview shows "
+        "the new curve."
+    ),
+}
 
 STATE_LAST_SYNC = "last_sync_at"
 STATE_LAST_RESULT = "last_sync_result"
 STATE_BACKFILL_DONE = "backfill_completed_at"
 STATE_LAST_REACHABLE = "decaid_last_reachable_at"
 STATE_DECAID_VERSION = "decaid_version"
+#: T46: the tablet's rating scale, the Decaid version it was determined for,
+#: and when the annotations were re-read after the switch to 0-10.
+STATE_ENJOYMENT_SCALE = "enjoyment_scale"
+STATE_ENJOYMENT_SCALE_FOR = "enjoyment_scale_version"
+STATE_ENJOYMENT_REREAD = "enjoyment_reread_at"
 
 #: Cap on detail requests per run. A detail weighs about 140 kB; for the first
 #: backfill of 168 shots that is a good 23 MB which would otherwise have to go
@@ -84,6 +137,10 @@ class SyncResult:
     waiting_for_tablet: bool = False
     #: Detail requests still outstanding when the cap kicked in.
     pending: int = 0
+    #: T46: the tablet's rating scale, and how many shots the one-off re-read
+    #: of annotations after the switch to 0-10 changed.
+    enjoyment_scale: str = SCALE_100
+    annotations_reread: int | None = None
     #: Blocking: transient problems where a later attempt can help.
     errors: list[str] = field(default_factory=list)
     #: Non-blocking: deterministic findings. A retry changes nothing about
@@ -113,7 +170,7 @@ async def run_sync(
     full: bool = False,
     config: Config | None = None,
 ) -> SyncResult:
-    """One sync run. ``full=True`` fetches every shot again.
+    """One sync run. ``full`` labels it a backfill; what is fetched is the same.
 
     ``config`` enables the guards; without it only the sync runs. That keeps
     the ingestion tests free of guard logic and vice versa.
@@ -122,7 +179,7 @@ async def run_sync(
     result = SyncResult(mode="backfill" if full else "incremental")
 
     try:
-        await _sync_beans(client, db, result)
+        result.enjoyment_scale = await _sync_beans(client, db, result)
         listed = await _list_all_shots(client)
     except DecaidUnreachable:
         result.waiting_for_tablet = True
@@ -136,6 +193,12 @@ async def run_sync(
         await asyncio.to_thread(_persist, db, result)
         log.error("sync aborted", extra={"fields": {"error": exc.code}})
         return result
+
+    if (result.enjoyment_scale == SCALE_10
+            and not await asyncio.to_thread(db.get_state, STATE_ENJOYMENT_REREAD)):
+        result.annotations_reread = await asyncio.to_thread(
+            _reread_annotations, db, listed)
+        await asyncio.to_thread(db.set_state, STATE_ENJOYMENT_REREAD, utc_now_iso())
 
     known = await asyncio.to_thread(db.known_shot_versions)
     # A shot is fetched when it is new or has changed - in a backfill too.
@@ -171,11 +234,13 @@ async def run_sync(
     )
 
     for item in stale:
-        if await _ingest_shot(client, db, item["id"], result) is False:
+        if await _ingest_shot(client, db, item["id"], result,
+                              result.enjoyment_scale) is False:
             break
 
     result.metrics_computed = await asyncio.to_thread(warm_metrics_cache, db)
     await asyncio.to_thread(db.link_shots_to_beans)
+
     if config is not None:
         await _run_guards(db, config, result)
     result.duration_ms = int((time.monotonic() - started) * 1000)
@@ -221,7 +286,8 @@ async def _run_guards(db: Database, config: Config, result: SyncResult) -> None:
 
 
 async def _ingest_shot(
-    client: DecaidClient, db: Database, shot_id: str, result: SyncResult
+    client: DecaidClient, db: Database, shot_id: str, result: SyncResult,
+    scale: str = SCALE_100,
 ) -> bool:
     """Fetch and store one shot. ``False`` means: tablet gone, end the run."""
     try:
@@ -239,7 +305,8 @@ async def _ingest_shot(
 
     try:
         synced_at = utc_now_iso()
-        shot = shot_row_from_decaid(detail, synced_at)
+        shot = shot_row_from_decaid(detail, synced_at, scale)
+        _carry_ambiguity(shot, await asyncio.to_thread(db.get_shot_row, shot_id), scale)
         series = series_rows_from_decaid(detail)
         is_new = await asyncio.to_thread(db.upsert_shot, shot, series)
     except Exception as exc:  # noqa: BLE001 - a single failure must not kill the run
@@ -280,16 +347,14 @@ async def _link_profile(
     result.profiles_linked += 1
 
 
-async def _sync_beans(client: DecaidClient, db: Database, result: SyncResult) -> None:
+async def _sync_beans(client: DecaidClient, db: Database, result: SyncResult) -> str:
     """Beans and batches. Both lists are small and come unpaginated.
 
     Decaid's version is noted along the way: ``status()`` works on the database
-    only and cannot ask for itself.
+    only and cannot ask for itself. So is its rating scale, which the shots
+    are read with; that is what this returns.
     """
-    info = await client.info()
-    await asyncio.to_thread(
-        db.set_state, STATE_DECAID_VERSION, str(info.get("version") or "")
-    )
+    scale = await enjoyment_scale(client, db)
     synced_at = utc_now_iso()
     beans = [bean_row_from_decaid(b, synced_at) for b in await client.beans()]
     batches = [batch_row_from_decaid(b, synced_at) for b in await client.bean_batches()]
@@ -297,6 +362,7 @@ async def _sync_beans(client: DecaidClient, db: Database, result: SyncResult) ->
         result.beans = await asyncio.to_thread(db.upsert_beans, beans)
     if batches:
         result.bean_batches = await asyncio.to_thread(db.upsert_bean_batches, batches)
+    return scale
 
 
 async def _list_all_shots(client: DecaidClient) -> list[dict[str, Any]]:
@@ -312,6 +378,94 @@ async def _list_all_shots(client: DecaidClient) -> list[dict[str, Any]]:
         if offset >= page.total:
             break
     return items
+
+
+async def enjoyment_scale(client: DecaidClient, db: Database) -> str:
+    """The tablet's rating scale, determined once per Decaid version (T46).
+
+    The probe asks the behaviour (``rejects_enjoyment_over_ten``); the build
+    number is only the fallback when it gives no clear answer.
+    """
+    info = await client.info()
+    version = str(info.get("fullVersion") or info.get("version") or "")
+    await asyncio.to_thread(db.set_state, STATE_DECAID_VERSION, version)
+    known = await asyncio.to_thread(db.get_state, STATE_ENJOYMENT_SCALE)
+    if known and await asyncio.to_thread(db.get_state, STATE_ENJOYMENT_SCALE_FOR) == version:
+        return known
+    refused = await client.rejects_enjoyment_over_ten()
+    if refused is None:
+        refused = _build_number(info) >= ENJOYMENT_0_10_FROM_BUILD
+    scale = SCALE_10 if refused else SCALE_100
+    await asyncio.to_thread(db.set_state, STATE_ENJOYMENT_SCALE, scale)
+    await asyncio.to_thread(db.set_state, STATE_ENJOYMENT_SCALE_FOR, version)
+    if scale != known:
+        log.info("enjoyment scale", extra={"fields": {"scale": scale, "version": version}})
+    return scale
+
+
+def _build_number(info: dict[str, Any]) -> int:
+    raw = info.get("buildNumber") or str(info.get("fullVersion") or "").partition("+")[2]
+    try:
+        return int(str(raw))
+    except ValueError:
+        return 0
+
+
+def _carry_ambiguity(row: dict[str, Any], previous: Any, scale: str) -> None:
+    """Keep a rating marked ambiguous across the switch to 0-10 (T46).
+
+    Decaid's migration leaves such a value as it was and does not touch
+    ``updatedAt``, so read on 0-10 it would pass for canonical. It still is
+    not - until someone rates the shot again, which moves ``updatedAt``.
+    """
+    if (scale == SCALE_10 and previous is not None and previous["enjoyment_ambiguous"]
+            and previous["enjoyment"] == row["enjoyment"]
+            and previous["updated_at"] == row["updated_at"]):
+        row["enjoyment_ambiguous"] = 1
+
+
+def _reread_annotations(db: Database, listed: list[dict[str, Any]]) -> int:
+    """Re-read every archived shot's annotations from the list, once (T46).
+
+    Decaid's schema-6 migration rescales ratings without touching
+    ``updatedAt``, so the cursor in ``run_sync`` never sees it. The list
+    carries the annotations, so this costs no detail request. Returns how many
+    shots changed.
+    """
+    stored = db.annotation_rows()
+    synced_at = utc_now_iso()
+    rows = []
+    for item in listed:
+        previous = stored.get(item.get("id"))
+        if previous is None:
+            continue           # not archived yet - the normal path fetches it
+        fields = annotation_fields(item, SCALE_10)
+        probe = {**fields, "updated_at": _stamp(item.get("updatedAt"))}
+        _carry_ambiguity(probe, previous, SCALE_10)
+        fields["enjoyment_ambiguous"] = probe["enjoyment_ambiguous"]
+        if all(previous[k] == v for k, v in fields.items()):
+            continue
+        rows.append({
+            **fields, "id": item["id"], "synced_at": synced_at,
+            "weights_changed": (previous["dose_g"], previous["yield_g"])
+                               != (fields["dose_g"], fields["yield_g"]),
+            "raw_json": json.dumps(item, ensure_ascii=False, separators=(",", ":")),
+        })
+    return db.update_annotations(rows)
+
+
+def _with_storage_events(batch: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
+    """``fields``, plus Beanie's event list when they touch the freezer (T57).
+
+    Decaid replaces ``extras`` whole on a PUT, so the rest of it goes along
+    exactly as it was read.
+    """
+    extras = batch.get("extras") if isinstance(batch.get("extras"), dict) else {}
+    events = mirrored_events(events_of(extras.get("storageEvents")), fields,
+                             datetime.now(UTC))
+    if events is None:
+        return fields
+    return {**fields, "extras": {**extras, "storageEvents": events}}
 
 
 def _stamp(value: Any) -> str | None:
@@ -351,11 +505,10 @@ async def refresh_shot(client: DecaidClient, db: Database, shot_id: str) -> dict
     """
     detail = await client.get_shot(shot_id)
     synced_at = utc_now_iso()
-    await asyncio.to_thread(
-        db.upsert_shot,
-        shot_row_from_decaid(detail, synced_at),
-        series_rows_from_decaid(detail),
-    )
+    scale = await asyncio.to_thread(db.get_state, STATE_ENJOYMENT_SCALE) or SCALE_100
+    shot = shot_row_from_decaid(detail, synced_at, scale)
+    _carry_ambiguity(shot, await asyncio.to_thread(db.get_shot_row, shot_id), scale)
+    await asyncio.to_thread(db.upsert_shot, shot, series_rows_from_decaid(detail))
     await asyncio.to_thread(metrics_for_shot, db, shot_id, refresh=True)
     return detail
 
@@ -379,6 +532,8 @@ class SyncCoordinator:
         self._db = db
         self._config = config
         self._lock = asyncio.Lock()
+        #: Replaced in tests; the upload watch waits between log reads.
+        self._sleep = asyncio.sleep
 
     async def run(self, *, full: bool | None = None) -> SyncResult:
         async with self._lock:
@@ -405,6 +560,10 @@ class SyncCoordinator:
         except ValueError:
             return None
         return (datetime.now(UTC) - last).total_seconds()
+
+    async def enjoyment_scale(self) -> str:
+        """The tablet's rating scale, checked against its current version."""
+        return await enjoyment_scale(self._client, self._db)
 
     async def write_shot(
         self, shot_id: str, fields: dict[str, Any]
@@ -439,7 +598,8 @@ class SyncCoordinator:
         """Change a batch, with read-back."""
         async with self._lock:
             before = await self._find(self._client.bean_batches(), batch_id)
-            await self._client.update_bean_batch(batch_id, dict(fields))
+            await self._client.update_bean_batch(
+                batch_id, _with_storage_events(before, dict(fields)))
             after = await self._find(self._client.bean_batches(), batch_id)
             await asyncio.to_thread(
                 self._db.upsert_bean_batches,
@@ -449,7 +609,7 @@ class SyncCoordinator:
         return before, after
 
     async def write_workflow(
-        self, fields: dict[str, Any]
+        self, fields: dict[str, Any],
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Change the workflow context, with read-back.
 
@@ -461,14 +621,334 @@ class SyncCoordinator:
         ``_coffee_labels`` for why that is our job rather than Decaid's.
         """
         patch = dict(fields)
+        reference = patch.pop("profileId", None)
+        profile: dict[str, Any] | None = None
+        records: list[dict[str, Any]] = []
+        if reference:
+            # The workflow embeds the profile as an object and holds no id
+            # (SPEC T38), so selecting one means copying it in. An unknown
+            # reference is refused here: Decaid would take any object at all.
+            records = await self._client.profiles(include_hidden=True)
+            profile = resolve_profile(records, str(reference))["profile"]
+        return await self._apply(patch, profile, records)
+
+    async def _apply(
+        self, patch: dict[str, Any], profile: dict[str, Any] | None,
+        records: list[dict[str, Any]],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The one path that writes the workflow.
+
+        `set_workflow` and `apply_recipe` both end here, so the batch labels
+        (T28) and the upload watch (T47) cannot be had by one and missed by the
+        other. A profile change overwrites the workflow without asking: a tune
+        made on the tablet lives on in the bean's recipe (M13), not in a guard.
+        """
+        patch = dict(patch)
         if patch.get("beanBatchId"):
             patch.update(await self._coffee_labels(str(patch["beanBatchId"])))
+        body: dict[str, Any] = {}
+        if profile is not None:
+            body["profile"] = profile
+        if patch:
+            body["context"] = patch
 
         async with self._lock:
-            before = (await self._client.workflow()).get("context") or {}
-            await self._client.update_workflow({"context": patch})
-            after = (await self._client.workflow()).get("context") or {}
+            before_wf = await self._client.workflow()
+            watch = await self._before_upload(before_wf, profile)
+            await self._client.update_workflow(body)
+            after_wf = await self._client.workflow()
+        upload = await self._after_upload(watch)
+
+        before = dict(before_wf.get("context") or {})
+        after = dict(after_wf.get("context") or {})
+        if upload is not None:
+            after[MACHINE_UPLOAD] = upload
+        if profile is not None:
+            for side, workflow in ((before, before_wf), (after, after_wf)):
+                running = running_profile(workflow.get("profile"), records)
+                side["profileId"] = running.get("id") if running else None
+                side["profileTitle"] = (workflow.get("profile") or {}).get("title")
         return before, after
+
+    # ------------------------------------------------ Profile upload (T47)
+
+    async def _before_upload(
+        self, before_wf: dict[str, Any], profile: dict[str, Any] | None,
+    ) -> tuple[str, Any] | None:
+        """What to watch from, if this write makes Decaid upload a profile.
+
+        Decaid uploads whenever the workflow's profile object changes, a new
+        title included - so only an identical profile is left alone. Before
+        the PUT: whether the DE1 is connected (Decaid skips the upload
+        silently otherwise), and the tablet's clock as the log shows it.
+        """
+        current = before_wf.get("profile")
+        if profile is None or (current and same_brew(current, profile)
+                               and current.get("title") == profile.get("title")):
+            return None
+        link = await self._machine_link()
+        if link == "disconnected":
+            return link, None
+        try:
+            mark = newest(await self._client.log_tail())
+        except DecaidError:
+            mark = None
+        return link, mark
+
+    async def _after_upload(self, watch: tuple[str, Any] | None) -> dict[str, Any] | None:
+        """Watch Decaid's log for the upload to end, a few seconds at most."""
+        if watch is None:
+            return None
+        link, mark = watch
+        if link == "disconnected":
+            return self._upload_result("pending_connection", link)
+        if mark is not None:
+            for _ in range(int(WATCH_SECONDS / POLL_SECONDS)):
+                await self._sleep(POLL_SECONDS)
+                try:
+                    found = outcome(await self._client.log_tail(), mark)
+                except DecaidError:
+                    break
+                if found is not None:
+                    return self._upload_result(found.pop("profile_upload"), link, found)
+        return self._upload_result("unconfirmed", link)
+
+    @staticmethod
+    def _upload_result(state: str, link: str, extra: dict | None = None) -> dict[str, Any]:
+        result = {"profile_upload": state, "de1": link, **(extra or {})}
+        if state in UPLOAD_NOTES:
+            result["note"] = UPLOAD_NOTES[state]
+        return result
+
+    async def _machine_link(self) -> str:
+        """``connected``, ``disconnected`` or ``unknown`` - the DE1 over Bluetooth."""
+        try:
+            devices = await self._client.devices()
+        except DecaidError:
+            return "unknown"
+        machine = next((d for d in devices if d.get("type") == "machine"), None)
+        if machine is None:
+            return "disconnected"
+        return "connected" if machine.get("state") == "connected" else "disconnected"
+
+    # -------------------------------------------------------------- Recipes
+
+    async def save_workflow_profile(self, title: str | None) -> dict[str, Any]:
+        """Keep the profile the workflow is running as a named profile.
+
+        Refused when that content is already stored: Decaid would answer the
+        POST with 201 and the existing record, dropping the new title (T39) -
+        a success report for a profile that was never made. The existing one is
+        named instead.
+
+        Afterwards the workflow is given the stored copy back. Same brewing
+        content, so nothing about the next shot changes; but the workflow then
+        carries the new title, and machine and tablet list say the same thing.
+        """
+        async with self._lock:
+            workflow = await self._client.workflow()
+            embedded = workflow.get("profile")
+            if not embedded:
+                raise ValidationError(["profile: the workflow carries no profile"])
+            records = await self._client.profiles(include_hidden=True)
+            existing = running_profile(embedded, records)
+            if existing is not None:
+                raise AlreadyExists(
+                    "The workflow's profile is already stored as "
+                    f"{(existing.get('profile') or {}).get('title')!r} "
+                    f"({existing.get('id')}, {existing.get('visibility')}). Nothing "
+                    "was created."
+                )
+            context = workflow.get("context") or {}
+            title = title or default_title(context.get("coffeeRoaster"),
+                                           context.get("coffeeName"))
+            if not title:
+                raise ValidationError(["title: give one - the workflow names no "
+                                       "coffee to call it after"])
+            taken = [str((r.get("profile") or {}).get("title") or "")
+                     for r in records if r.get("visibility") != "deleted"]
+            title = check_title(title, taken)
+            profile = dict(embedded, title=title)
+            created = await self._client.create_profile(
+                profile, parent_id=None,
+                metadata={MARKER_KEY: MARKER, "savedFromWorkflow": True},
+            )
+            after = await self._client.profile(str(created["id"]))
+            await self._client.update_workflow({"profile": after["profile"]})
+        return {"record": after, "was_titled": embedded.get("title")}
+
+    async def apply_bean_recipe(
+        self, bean: dict[str, Any], shot: dict[str, Any],
+    ) -> tuple[tuple[dict[str, Any], dict[str, Any]], dict[str, Any]]:
+        """A bean's recipe onto the machine: Beanie's rule, through ``_apply``.
+
+        ``shot`` is the bean's recipe shot from the archive (``recipe_shot``);
+        batch and stored profiles are read live, as Beanie reads them.
+        """
+        batches, records = await asyncio.gather(
+            self._client.bean_batches(str(bean["id"])),
+            self._client.profiles())
+        batch = recipe_batch(batches)
+        body = recipe_workflow(bean, batch, shot, records)
+        context = {k: v for k, v in body["context"].items()
+                   if k not in ("coffeeName", "coffeeRoaster")}   # _apply derives them
+        if not context.get("beanBatchId"):
+            # No batch at all: Beanie sends an explicit null and the bean's labels.
+            context |= {"beanBatchId": None, "coffeeName": bean.get("name"),
+                        "coffeeRoaster": bean.get("roaster")}
+        profile = body.get("profile")
+        result = await self._apply(context, profile, records)
+        return result, {"shot": shot.get("id"), "shot_at": shot.get("timestamp"),
+                        "batch": (batch or {}).get("id"),
+                        "profile": (profile or {}).get("title")}
+
+    # ------------------------------------------------------------ Creating
+
+    async def create_bean(self, fields: dict[str, Any]) -> dict[str, Any]:
+        """A new bean, read back from Decaid and archived.
+
+        Refused before sending when a bean of the same name and roaster exists -
+        compared case- and whitespace-insensitively, because "Tugu Kawisari"
+        and "tugu  kawisari" are one roaster to a person and two records to a
+        database. A second bean by accident splits a coffee's history in two,
+        and nothing afterwards brings the halves back together.
+        """
+        async with self._lock:
+            existing = await self._client.beans()
+            twin = same_bean(existing, fields.get("name"), fields.get("roaster"))
+            if twin is not None:
+                raise AlreadyExists(
+                    f"A bean {twin.get('name')!r} by {twin.get('roaster')!r} "
+                    f"already exists as {twin.get('id')}. Nothing was created; "
+                    "use that one, or give the new bean a distinguishing name."
+                )
+            created = await self._client.create_bean(dict(fields))
+            after = await self._client.bean(str(created["id"]))
+            await asyncio.to_thread(
+                self._db.upsert_beans, [bean_row_from_decaid(after, utc_now_iso())]
+            )
+        return after
+
+    async def create_batch(self, bean_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        """A new batch of an existing bean, read back and archived.
+
+        The bean is looked up first: Decaid would answer an unknown one with a
+        404 anyway, but "no such bean" is a clearer thing to be told than "not
+        found" about a path nobody typed.
+        """
+        async with self._lock:
+            try:
+                bean = await self._client.bean(bean_id)
+            except ShotNotFound:
+                raise ShotNotFound(
+                    f"Decaid has no bean {bean_id!r}. Nothing was created."
+                ) from None
+            created = await self._client.create_bean_batch(bean_id, dict(fields))
+            mirrored = _with_storage_events(created, dict(fields))
+            if "extras" in mirrored:
+                # Beanie's history for a batch that starts out frozen (T57).
+                await self._client.update_bean_batch(
+                    str(created["id"]), {"extras": mirrored["extras"]})
+            after = await self._client.bean_batch(str(created["id"]))
+            await asyncio.to_thread(
+                self._db.upsert_bean_batches,
+                [batch_row_from_decaid(after, utc_now_iso())],
+            )
+        after["_bean"] = {"name": bean.get("name"), "roaster": bean.get("roaster")}
+        return after
+
+    # ------------------------------------------------------------ Profiles
+
+    async def profile_catalogue(self) -> list[dict[str, Any]]:
+        return await self._client.profiles(include_hidden=True)
+
+    async def clone_profile(
+        self, source: str, overrides: dict[str, Any], *,
+        title: str | None, bean_id: str | None,
+    ) -> dict[str, Any]:
+        """A copy of ``source`` with lineage back to it, and the overrides applied.
+
+        Refused when the result would brew exactly like an existing profile.
+        Decaid's id is a hash of the brewing content, so such a copy would not
+        be a new profile but the old one under a second name - and whatever
+        Decaid then does with it, it is not what the caller asked for.
+        """
+        async with self._lock:
+            records = await self._client.profiles(include_hidden=True)
+            original = resolve_profile(records, source)
+
+            if title is None and bean_id:
+                bean = await self._client.bean(bean_id)
+                title = default_title(bean.get("roaster"), bean.get("name"))
+            if title is None:
+                raise ValidationError([
+                    "title: give a title, or a bean to name the profile after "
+                    f"(\"<roaster>{TITLE_SEPARATOR}<bean>\")"
+                ])
+            taken = [str((r.get("profile") or {}).get("title") or "")
+                     for r in records if r.get("visibility") != "deleted"]
+            title = check_title(title, taken)
+
+            profile, changes = apply_overrides(original["profile"], overrides,
+                                               title=title)
+            if not changes_brewing(changes):
+                raise ValidationError([
+                    "overrides: a copy that brews identically is the same profile "
+                    "to Decaid - its id is a hash of the brewing content. Change at "
+                    "least one of " + ", ".join(OVERRIDES) + ", or select the "
+                    "original directly."
+                ])
+            twin = next((r for r in records if same_brew(r.get("profile"), profile)),
+                        None)
+            if twin is not None:
+                raise AlreadyExists(
+                    f"A profile that brews exactly like this already exists: "
+                    f"{(twin.get('profile') or {}).get('title')!r} "
+                    f"({twin.get('id')}, {twin.get('visibility')}). Nothing was "
+                    "created; select that one instead."
+                )
+            created = await self._client.create_profile(
+                profile, parent_id=original.get("id"),
+                metadata={MARKER_KEY: MARKER, "clonedFrom": original.get("id")},
+            )
+            after = await self._client.profile(str(created["id"]))
+        return {"record": after, "source": original, "changes": changes}
+
+    async def update_profile(
+        self, profile_id: str, overrides: dict[str, Any], *, allow_foreign: bool,
+    ) -> dict[str, Any]:
+        """Change one of our profiles; defaults are refused whatever is asked.
+
+        The id changes with the content (T37): Decaid replaces the record under
+        a new hash. So the read-back follows the id the PUT answered with, and
+        the response says so - a caller holding the old id would otherwise be
+        holding a reference to nothing.
+        """
+        async with self._lock:
+            records = await self._client.profiles(include_hidden=True)
+            record = resolve_profile(records, profile_id)
+            title = (record.get("profile") or {}).get("title")
+            if is_default(record):
+                raise Protected(
+                    f"{title!r} is one of Decaid's bundled defaults. Those are not "
+                    "changed from here - clone it and change the copy."
+                )
+            if not made_here(record) and not allow_foreign:
+                raise Protected(
+                    f"{title!r} was not made by clone_profile, so it may be a "
+                    "profile somebody tuned by hand on the tablet. Only change it "
+                    "if the user named it explicitly, and then say allow_foreign."
+                )
+            profile, changes = apply_overrides(record["profile"], overrides)
+            if not changes_brewing(changes):
+                raise ValidationError(["overrides: nothing to change"])
+
+            workflow = await self._client.workflow()
+            was_running = same_brew(workflow.get("profile"), record["profile"])
+            updated = await self._client.update_profile(str(record["id"]), profile)
+            after = await self._client.profile(str(updated["id"]))
+        return {"record": after, "before": record, "changes": changes,
+                "workflow_ran_previous_version": was_running}
 
     async def _coffee_labels(self, batch_id: str) -> dict[str, Any]:
         """``coffeeName``/``coffeeRoaster`` for a batch, resolved through its bean.
@@ -497,6 +977,17 @@ class SyncCoordinator:
         bean = await self._find(self._client.beans(), str(bean_id))
         return {"coffeeName": bean.get("name"), "coffeeRoaster": bean.get("roaster")}
 
+    async def profile_stored(self, workflow: dict[str, Any]) -> bool | None:
+        """Whether the workflow's profile is a stored record - for information only."""
+        profile = workflow.get("profile")
+        if not profile:
+            return None
+        try:
+            records = await self._client.profiles(include_hidden=True)
+        except DecaidError:
+            return None
+        return running_profile(profile, records) is not None
+
     async def read_workflow(self) -> dict[str, Any]:
         return await self._client.workflow()
 
@@ -516,6 +1007,21 @@ class SyncCoordinator:
 
     async def aclose(self) -> None:
         await self._client.aclose()
+
+
+def same_bean(
+    beans: list[dict[str, Any]], name: Any, roaster: Any
+) -> dict[str, Any] | None:
+    """An existing bean with this name and roaster, compared as a person would.
+
+    Case and runs of whitespace do not make a different coffee.
+    """
+    def key(value: Any) -> str:
+        return " ".join(str(value or "").split()).casefold()
+
+    wanted = (key(name), key(roaster))
+    return next((b for b in beans if (key(b.get("name")), key(b.get("roaster")))
+                 == wanted), None)
 
 
 #: Back off when the tablet is off. It only runs while coffee is being made;
@@ -554,8 +1060,11 @@ __all__ = [
     "IDLE_BACKOFF_MULTIPLIER",
     "MAX_DETAILS_PER_RUN",
     "QUICK_SYNC_MAX_AGE_S",
+    "MACHINE_UPLOAD",
     "STATE_BACKFILL_DONE",
     "STATE_DECAID_VERSION",
+    "STATE_ENJOYMENT_REREAD",
+    "STATE_ENJOYMENT_SCALE",
     "STATE_LAST_REACHABLE",
     "STATE_LAST_RESULT",
     "STATE_LAST_SYNC",

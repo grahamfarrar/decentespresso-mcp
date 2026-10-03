@@ -35,6 +35,8 @@ from .decaid_client import (
     DecaidError,
     DecaidUnreachable,
 )
+from .decaid_mapping import SCALE_100
+from .freezing import frozen_periods
 from .guards import (
     ALL_RULES,
     as_datetime,
@@ -43,6 +45,8 @@ from .guards import (
     run_rules,
 )
 from .metrics import METRICS_VERSION, curve_shape, downsample_curve, metrics_for_shot
+from .profile_forge import made_here
+from .recipes import is_service, recipe_name, recipe_shot
 from .stats import _iso as _stats_iso
 from .stats import (
     batch_usage,
@@ -51,9 +55,11 @@ from .stats import (
     summarise,
 )
 from .sync import (
+    MACHINE_UPLOAD,
     QUICK_SYNC_MAX_AGE_S,
     STATE_BACKFILL_DONE,
     STATE_DECAID_VERSION,
+    STATE_ENJOYMENT_SCALE,
     STATE_LAST_REACHABLE,
     STATE_LAST_RESULT,
     STATE_LAST_SYNC,
@@ -90,6 +96,64 @@ READ_ONLY = {"readOnlyHint": True, "openWorldHint": False}
 #: Decaid maintains these itself on every write (T15). They move on their own
 #: and reporting them as a change would be noise, not information.
 SERVER_MANAGED_FIELDS = frozenset({"createdAt", "updatedAt"})
+
+
+def _same(sent: Any, got: Any) -> bool:
+    """Whether a read-back holds what was sent, in Decaid's own spelling.
+
+    Numbers compare as numbers (18 and 18.0), and a date comes back with a
+    time attached (T22), so "2026-09-01" matches "2026-09-01T00:00:00.000Z".
+    """
+    if sent == got:
+        return True
+    if isinstance(sent, int | float) and isinstance(got, int | float) \
+            and not isinstance(sent, bool) and not isinstance(got, bool):
+        return float(sent) == float(got)
+    if isinstance(sent, str) and isinstance(got, str) and len(sent) == 10:
+        return got.startswith(sent + "T")
+    return False
+
+
+def _outcome(
+    payload: dict[str, Any], before: dict[str, Any], after: dict[str, Any],
+) -> tuple[dict[str, Any], list[str], list[str]]:
+    """``(changes, unchanged, not_taken)`` for one write, from the read-back.
+
+    ``unchanged`` held the value already - nothing to report but that.
+    ``not_taken`` came back different from what was sent: Decaid refused or
+    discarded it. The two used to share one list, and a value that simply
+    stood already was reported as not taken.
+    """
+    changes = {name: {"before": before.get(name), "after": after.get(name)}
+               for name in payload}
+    unchanged = [n for n, v in payload.items()
+                 if _same(v, after.get(n)) and _same(v, before.get(n))]
+    not_taken = [n for n, v in payload.items() if not _taken(n, v, after)]
+    return changes, unchanged, not_taken
+
+
+def _taken(name: str, sent: Any, after: dict[str, Any]) -> bool:
+    """A profile can be named by id or by exact title; the read-back holds the id.
+
+    Without this a set_workflow by title came back "not taken" although the
+    profile was running - a slip in the first version of this comparison,
+    caught by the M13 tests.
+    """
+    if _same(sent, after.get(name)):
+        return True
+    return (name == "profileId" and isinstance(sent, str)
+            and str(after.get("profileTitle") or "").casefold() == sent.strip().casefold())
+
+
+def _report(result: dict[str, Any], unchanged: list[str], not_taken: list[str]) -> None:
+    if unchanged:
+        result["unchanged"] = unchanged
+    if not_taken:
+        result["not_taken"] = not_taken
+        result["note"] = (
+            "Decaid did not take these fields - the read-back differs from "
+            "what was sent: " + ", ".join(not_taken) + "."
+        )
 
 INSTRUCTIONS = """\
 Local archive of espresso shots pulled on a Decent DE1. The source is Decaid on
@@ -138,6 +202,11 @@ TERMS that appear in the metrics:
   0.0 in Decaid, which is not a rating. Ingestion stores those as `null`, so a
   0 that does reach you is a deliberate rating by the user.
 
+- `enjoyment` is 0-10 throughout the archive (stars x2), whatever scale
+  the tablet runs. `enjoyment_ambiguous: true` marks a rating from 1 to 10 read
+  off a tablet still on 0-100: it could be either scale and is left as it was.
+  Say so rather than reading it as low; stats leave it out of means.
+
 CURVE - two representations, and the first one is almost always enough:
 
 - `curve_shape` always comes along. It describes the shot segment by segment
@@ -158,7 +227,7 @@ CURVE - two representations, and the first one is almost always enough:
   oscillation inside one segment, say. A missing channel means there was not a
   single reading for it.
 
-GUARDS - `audit_archive` checks four rules. What they mean:
+GUARDS - `audit_archive` checks five rules. What they mean:
 
 - `grind_not_adjusted` - the batch was changed and the grind setting stayed put.
   Every bean grinds differently; the first shot after such a change is usually
@@ -170,17 +239,42 @@ GUARDS - `audit_archive` checks four rules. What they mean:
   number. `not_checked` says how many shots the rule sat out for want of a
   roast date; it never guesses one.
 - `missing_rating` - no rating was added once the grace period had passed.
+- `missing_batch` - a coffee shot names no batch. `lost: true` means the shot
+  before still had one: the coffee dropped out of the workflow in between.
 - `dose_outlier` - weights do not match the workflow target. `basis` says what
   was measured against: the workflow target, or the batch median as a fallback.
 
 A finding is a hint, not a verdict. It always names the numbers it rests on -
 pass those along instead of merely repeating the message.
 
-WRITING - call the `update_*` and `set_*` tools only on an explicit instruction,
-never on your own initiative and never "just to be safe". Set exactly the fields
-that were named. Confirm afterwards from the values that come back, not from
-what was sent: if a field appears under `unchanged`, Decaid did not take it -
-say so instead of reporting success.
+WRITING - call the `update_*`, `create_*`, `clone_*` and `set_*` tools only on an
+explicit instruction, never on your own initiative and never "just to be safe".
+Set exactly the fields that were named. Confirm afterwards from the values that
+come back, not from what was sent: a field under `not_taken` came back
+different - Decaid refused it; say so instead of reporting success. One under
+`unchanged` already had that value.
+A profile change carries `machine.profile_upload`: the profile reaches the DE1
+over Bluetooth after the tool answers. `confirmed` (with `seconds`) means it
+arrived; `failed_retrying`, `pending_connection` and `unconfirmed` mean it may
+not have - pass the `note` on, and tell the user to wait for the new curve on
+the tablet before starting the shot. `update_shot` takes
+`enjoyment` on the tablet's scale, which `status` shows as `enjoyment_scale`:
+on `0-100` stars x20 (1 to 10 refused), on `0-10` stars x2.
+
+COFFEE ONBOARDING FLOW - a new bag, set up for the machine. Four steps, in this
+order, each one confirmed by the user before the next:
+1. `create_bean` (skip if `list_beans` already has it - reuse, never duplicate)
+2. `create_batch` for that bean
+3. `clone_profile` from the profile they brew it on, named after the bean
+   ("<roaster> - <bean>"), with the overrides they asked for
+4. `set_workflow` with the new `beanBatchId` and `profileId`
+Stop at the first error and say which step failed; never skip a step silently
+or carry on around it.
+
+RECIPES - a recipe is a bean's most recent real shot, the same thing Beanie
+restores with a tap: the bean's newest usable batch, the shot's grind, planned
+dose and yield, and its profile. Nothing is saved or named. A change set in the
+chat but not brewed yet lives in the workflow until the next shot.
 
 DIAGNOSIS - what the machine measured about the coffee bed itself:
 
@@ -239,8 +333,9 @@ shots that produced under 5 g (aborts, which often run under an ordinary
 profile name). `busiest_day` is the exception and counts everything, giving
 the split - a day of flushes was still a day at the machine. Top lists carry
 `rated` next to `shots`, because a mean over one rating is not the claim a
-mean over ten is. Batches report what was used, not what is left: Decaid
-stores no weight on a batch, so a remainder would be invented.\
+mean over ten is. Means are on 0-10 and leave out `ambiguous` ratings.
+Batches report what was used, not what is left: Decaid stores no weight on a
+batch, so a remainder would be invented.\
 """
 
 
@@ -536,13 +631,16 @@ def build_mcp(
         return _batch_summary(usage[0] if usage else dict(row), full=True)
 
     @mcp.tool(annotations=READ_ONLY)
-    async def list_profiles() -> dict[str, Any]:
-        """Every profile with its versions.
+    async def list_profiles(on_tablet: bool = False) -> dict[str, Any]:
+        """Profiles the archived shots ran on, with their versions.
 
         `version_hash` is the identity of a version, `semantic_hash` groups
-        versions with identical targets - more in the
-        Server-Anweisungen.
+        versions with identical targets. `on_tablet=true` lists what is on the
+        tablet instead, live, with the ids `set_workflow`, `clone_profile` and
+        `update_profile` take - including profiles no shot has run yet.
         """
+        if on_tablet:
+            return await _tablet_profiles(coordinator)
         rows = await asyncio.to_thread(db.profile_overview)
         grouped: dict[str, list[dict[str, Any]]] = {}
         for row in rows:
@@ -654,7 +752,7 @@ def build_mcp(
         """Checks the archive for inconsistencies (rules: see the instructions).
 
         `since` as an ISO date or shorthand (`7d`, `2w`, `1m`); `rule` narrows
-        to one of the four rules.
+        to one of the five rules.
         """
         cutoff = _parse_time(since, "since")
         shots = await asyncio.to_thread(db.shots_for_guards, cutoff)
@@ -687,6 +785,7 @@ def build_mcp(
             "findings": [f.as_dict() for f in capped],
             "by_rule": _count_by_rule(findings),
             "not_checked": _drop_empty(bean_age_not_checkable(shots, batches)),
+            **_ambiguous_ratings(shots),
         }
 
 
@@ -729,10 +828,12 @@ def build_mcp(
 
     if coordinator is not None:
         _register_workflow_reader(mcp, coordinator)
+    _register_recipe_reader(mcp, db)
 
     if config.write_enabled and coordinator is not None:
         _register_update_shot(mcp, db, coordinator)
         _register_catalog_writes(mcp, db, coordinator)
+        _register_recipe_writes(mcp, db, coordinator)
 
     @mcp.custom_route("/healthz", methods=["GET"], include_in_schema=False)
     async def healthz(request: Request) -> Response:
@@ -758,6 +859,7 @@ def _register_workflow_reader(mcp: FastMCP, coordinator: SyncCoordinator) -> Non
         """
         try:
             workflow = await coordinator.read_workflow()
+            stored = await coordinator.profile_stored(workflow)
         except DecaidUnreachable as exc:
             raise ToolError(f"waiting_for_tablet: {exc}") from exc
         except DecaidError as exc:
@@ -774,6 +876,7 @@ def _register_workflow_reader(mcp: FastMCP, coordinator: SyncCoordinator) -> Non
             "target_dose_g": context.get("targetDoseWeight"),
             "target_yield_g": context.get("targetYield"),
             "profile": profile.get("title"),
+            "profile_stored": stored,
         }
 
 
@@ -793,9 +896,9 @@ def _register_catalog_writes(
     async def update_bean(id: str, fields: dict[str, Any]) -> dict[str, Any]:
         """Changes the master data of a bean in Decaid.
 
-        Identifier from `list_beans`. Allowed: name, roaster, species,
-        processing, notes, decaf. Applies retroactively to every shot of this
-        bean - say so beforehand.
+        Identifier from `list_beans`. An unknown field is refused with the full
+        list of allowed ones. Applies retroactively to every shot of this bean -
+        say so beforehand.
         """
         return await _write(coordinator.write_bean, BEAN, id, fields,
                             what="bean")
@@ -805,11 +908,12 @@ def _register_catalog_writes(
                      "destructiveHint": False, "openWorldHint": True},
     )
     async def update_batch(id: str, fields: dict[str, Any]) -> dict[str, Any]:
-        """Changes a bean batch (roast date, frozen state).
+        """Changes a bean batch: dates, freezer state, provenance, weights.
 
-        Allowed: roastDate, buyDate, freezeDate (each ISO YYYY-MM-DD), frozen.
-        Decaid keeps no thaw date - to thaw, set `frozen` to false; bean age is
-        an upper bound only from then on.
+        Identifier from `list_batches`; `get_batch` shows the current state.
+        Dates are ISO YYYY-MM-DD. To thaw, set `frozen` false and
+        `unfreezeDate` - with the date, bean age stays exact. An unknown field
+        is refused with the full list of allowed ones.
         """
         return await _write(coordinator.write_batch, BATCH, id, fields,
                             what="batch")
@@ -822,16 +926,279 @@ def _register_catalog_writes(
         """Sets what the next shot should run on.
 
         Changes the machine, not the archive. Allowed: grinderSetting,
-        grinderModel, targetDoseWeight, targetYield, beanBatchId. A profile
-        change is not possible - that belongs at the machine. Afterwards name
-        what is now set.
+        grinderModel, targetDoseWeight, targetYield, beanBatchId, profileId.
+        Afterwards name what is now set.
 
         `beanBatchId` also rewrites the coffee name and roastery shown on the
-        machine, resolved from the batch; they come back under `alongside`.
-        An unknown batch is refused rather than set.
+        machine; `profileId` (an id or exact title, from
+        `list_profiles(on_tablet=true)`) copies that profile in. What else
+        changed comes back under `alongside`. Unknown references are refused.
         """
-        return await _write(coordinator.write_workflow, WORKFLOW, None, fields,
-                            what="workflow")
+        result = await _write(coordinator.write_workflow, WORKFLOW, None, fields,
+                              what="workflow")
+        return result
+
+    @mcp.tool(annotations=CREATES)
+    async def create_bean(fields: dict[str, Any]) -> dict[str, Any]:
+        """Creates a bean in Decaid. `name` and `roaster` are required.
+
+        The same fields as `update_bean`. Refused, naming the existing one,
+        when a bean of that name and roaster is already there.
+        """
+        payload = _validated(fields, BEAN, required=("name", "roaster"))
+        after = await _call(coordinator.create_bean, payload, what="bean")
+        return {"id": after.get("id"), "bean": _decaid_view(after)}
+
+    @mcp.tool(annotations=CREATES)
+    async def create_batch(bean_id: str, fields: dict[str, Any]) -> dict[str, Any]:
+        """Creates a batch of an existing bean. Every field is optional.
+
+        The same fields as `update_batch`. `weight` also sets `weightRemaining`
+        (Decaid initialises one from the other and never counts it down).
+        """
+        payload = _validated(fields, BATCH)
+        after = await _call(coordinator.create_batch, bean_id, payload, what="batch")
+        bean = after.pop("_bean", {})
+        return {"id": after.get("id"), "bean": bean, "batch": _decaid_view(after)}
+
+    @mcp.tool(annotations=CREATES)
+    async def clone_profile(
+        source: str, overrides: dict[str, Any], title: str | None = None,
+        bean_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Copies a profile, with lineage to it, and changes what `overrides` says.
+
+        `source`: a profile id or exact title. `overrides`: temperature_c
+        (80-96), target_weight_g (10-100), main_setpoint (the pour step: bar up
+        to 10 or ml/s up to 8). Without `title` it is named after `bean_id` as
+        "<roaster> - <bean>". A copy must differ in brewing, not only in name.
+        """
+        result = await _call(coordinator.clone_profile, source, overrides,
+                             title=title, bean_id=bean_id, what="profile")
+        return _profile_result(result, key="source")
+
+    @mcp.tool(annotations={"readOnlyHint": False, "idempotentHint": True,
+                           "destructiveHint": False, "openWorldHint": True})
+    async def update_profile(
+        id: str, overrides: dict[str, Any], allow_foreign: bool = False,
+    ) -> dict[str, Any]:
+        """Changes one of this server's profiles - the same overrides as clone.
+
+        Bundled defaults are never changed. A profile made on the tablet needs
+        `allow_foreign` - set it only when the user named that profile. The id
+        changes with the content; the new one comes back.
+        """
+        result = await _call(coordinator.update_profile, id, overrides,
+                             allow_foreign=allow_foreign, what="profile")
+        return _profile_result(result, key="before")
+
+
+def _register_recipe_reader(mcp: FastMCP, db: Database) -> None:
+    """``list_recipes`` - derived from the archive, nothing stored."""
+
+    @mcp.tool(annotations=READ_ONLY)
+    async def list_recipes() -> dict[str, Any]:
+        """Each bean's recipe: the state of its most recent real shot."""
+        beans = {r["id"]: r for r in await asyncio.to_thread(db.beans)}
+        shots = await asyncio.to_thread(db.bean_shots)
+        batches = await asyncio.to_thread(db.batches_by_id)
+        seen: set[str] = set()
+        out = []
+        for shot in shots:                                  # newest first per bean
+            batch_id = ((shot.get("workflow") or {}).get("context") or {}).get("beanBatchId")
+            bean_id = (batches.get(batch_id) or {}).get("bean_id")
+            if bean_id in seen or bean_id not in beans or is_service(shot.get("workflow")):
+                continue
+            seen.add(bean_id)
+            out.append(_recipe_view(beans[bean_id], shot, batches.get(batch_id)))
+        return {"recipes": out}
+
+
+def _recipe_view(bean: dict[str, Any], shot: dict[str, Any],
+                 batch: dict[str, Any] | None) -> dict[str, Any]:
+    workflow = shot.get("workflow") or {}
+    context = workflow.get("context") or {}
+    started = as_datetime(shot.get("timestamp"))
+    age, certain = (bean_age_days(batch, datetime.now(UTC), started=started)
+                    if batch else (None, False))
+    return _drop_empty({
+        "name": recipe_name(bean),
+        "bean_id": bean.get("id"),
+        "shot_at": shot.get("timestamp"),
+        "batch_id": context.get("beanBatchId"),
+        "grinder_setting": context.get("grinderSetting"),
+        "dose_g": context.get("targetDoseWeight"),
+        "yield_g": context.get("targetYield"),
+        "profile": (workflow.get("profile") or {}).get("title"),
+        "bean_age_days": age,
+        "bean_age_certain": certain if age is not None else None,
+    })
+
+
+def _register_recipe_writes(
+    mcp: FastMCP, db: Database, coordinator: SyncCoordinator
+) -> None:
+    """Applying a bean's recipe, and keeping a tuned profile (SPEC §11.6)."""
+
+    @mcp.tool(annotations=CREATES)
+    async def save_workflow_profile(title: str | None = None) -> dict[str, Any]:
+        """Stores the profile the workflow is running as a named profile.
+
+        Optional. Default title "<roaster> - <bean>". Refused, naming it, if
+        that content is already stored.
+        """
+        result = await _call(coordinator.save_workflow_profile, title, what="profile")
+        record = result["record"]
+        return {
+            "id": record.get("id"),
+            "title": (record.get("profile") or {}).get("title"),
+            "was_titled_in_workflow": result["was_titled"],
+            "visible_on_tablet": record.get("visibility") == "visible",
+        }
+
+    @mcp.tool(annotations={"readOnlyHint": False, "idempotentHint": True,
+                           "destructiveHint": False, "openWorldHint": True})
+    async def apply_recipe(bean: str) -> dict[str, Any]:
+        """Sets the machine to a bean's recipe - by name, roaster or bean id."""
+        beans = await asyncio.to_thread(db.beans)
+        wanted = " ".join(bean.split()).casefold()
+        hits = [b for b in beans if b["id"] == bean.strip()
+                or wanted in " ".join(recipe_name(b).split()).casefold()]
+        if len(hits) != 1:
+            names = ", ".join(recipe_name(b) for b in hits[:6]) or "none"
+            raise ToolError(f"invalid_argument: {len(hits)} beans match {bean!r} "
+                            f"({names}) - name one")
+        (found,) = hits
+        shot = recipe_shot(await asyncio.to_thread(db.bean_shots, found["id"]))
+        if shot is None:
+            raise ToolError(f"no_recipe: {recipe_name(found)} has no real shot yet - "
+                            "set the machine with set_workflow instead")
+        (before, after), used = await _call(coordinator.apply_bean_recipe, found, shot,
+                                            what="workflow")
+        return _with_upload({"name": recipe_name(found), "from": used}, before, after)
+
+
+def _with_upload(out: dict[str, Any], before: dict[str, Any],
+                 after: dict[str, Any]) -> dict[str, Any]:
+    """The changes, and how the profile upload went (T47) when there was one."""
+    upload = after.pop(MACHINE_UPLOAD, None)
+    out["changes"] = _diff(before, after)
+    if upload is not None:
+        out["machine"] = upload
+    return out
+
+
+def _diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    """Every context field that moved, from the read-back."""
+    return {k: {"before": before.get(k), "after": after.get(k)}
+            for k in sorted(set(before) | set(after))
+            if k not in SERVER_MANAGED_FIELDS and before.get(k) != after.get(k)}
+
+
+#: For the tools that make something new: not idempotent - calling one twice
+#: makes two - and open-world, because it changes the machine.
+CREATES = {"readOnlyHint": False, "idempotentHint": False,
+           "destructiveHint": False, "openWorldHint": True}
+
+
+def _validated(
+    fields: dict[str, Any], ruleset: Ruleset, *, required: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    """The whitelist and validation of the update tools, plus what must be there.
+
+    Nulls are dropped: on an update they clear a field, on a creation they would
+    only send an empty one.
+    """
+    try:
+        payload = validate_fields(fields, ruleset)
+    except ValidationError as exc:
+        raise ToolError("invalid_argument: " + "; ".join(exc.problems)) from exc
+    payload = {k: v for k, v in payload.items() if v is not None}
+    missing = [name for name in required if not payload.get(name)]
+    if missing:
+        raise ToolError("invalid_argument: required: " + ", ".join(missing))
+    return payload
+
+
+async def _call(method: Any, *args: Any, what: str, **kwargs: Any) -> Any:
+    """Runs one creating call and turns its failures into tool errors.
+
+    A creation that timed out is the one case with no safe answer - Decaid may
+    have acted on it. The message says so instead of inviting a retry that
+    could make a second one.
+    """
+    started = time.perf_counter()
+    try:
+        result = await method(*args, **kwargs)
+    except ValidationError as exc:
+        raise ToolError("invalid_argument: " + "; ".join(exc.problems)) from exc
+    except DecaidUnreachable as exc:
+        raise ToolError(
+            f"waiting_for_tablet: {exc} If this happened mid-request the {what} "
+            "may exist anyway - check before trying again."
+        ) from exc
+    except DecaidError as exc:
+        raise ToolError(f"{exc.code}: {exc}") from exc
+    log.info(f"{what} created or changed", extra={"fields": {
+        "what": what, "dur_ms": round((time.perf_counter() - started) * 1000, 1),
+    }})
+    return result
+
+
+def _decaid_view(entity: dict[str, Any]) -> dict[str, Any]:
+    """An entity as Decaid returned it, minus its bookkeeping."""
+    return {k: v for k, v in entity.items()
+            if k not in SERVER_MANAGED_FIELDS and v is not None}
+
+
+def _profile_result(result: dict[str, Any], *, key: str) -> dict[str, Any]:
+    """A clone or an update, with what the tablet will now show."""
+    record = result["record"]
+    other = result[key]
+    profile = record.get("profile") or {}
+    out: dict[str, Any] = {
+        "id": record.get("id"),
+        "title": profile.get("title"),
+        "changes": result["changes"],
+        "visibility": record.get("visibility"),
+        "visible_on_tablet": record.get("visibility") == "visible",
+        "parent_id": record.get("parentId"),
+    }
+    if key == "source":
+        out["cloned_from"] = {"id": other.get("id"),
+                              "title": (other.get("profile") or {}).get("title")}
+    else:
+        out["previous_id"] = other.get("id")
+        if other.get("id") != record.get("id"):
+            out["note"] = ("Decaid identifies a profile by its brewing content, "
+                           "so the id changed with it. Use the new one.")
+        if result.get("workflow_ran_previous_version"):
+            out["workflow"] = (
+                "The workflow was running the previous version and still is - "
+                "it holds a copy, not a reference. Select this profile with "
+                "set_workflow to run the change."
+            )
+    return out
+
+
+async def _tablet_profiles(coordinator: SyncCoordinator | None) -> dict[str, Any]:
+    if coordinator is None:
+        raise ToolError("sync_unavailable: this server runs without a connection to Decaid.")
+    try:
+        records = await coordinator.profile_catalogue()
+    except DecaidUnreachable as exc:
+        raise ToolError(f"waiting_for_tablet: {exc}") from exc
+    return {"profiles": [
+        _drop_empty({
+            "id": r.get("id"),
+            "title": (r.get("profile") or {}).get("title"),
+            "default": bool(r.get("isDefault")) or None,
+            "made_here": made_here(r) or None,
+            "visibility": r.get("visibility"),
+            "parent_id": r.get("parentId"),
+        })
+        for r in records if r.get("visibility") != "deleted"
+    ]}
 
 
 async def _write(
@@ -852,16 +1219,13 @@ async def _write(
     try:
         args = (payload,) if target_id is None else (target_id, payload)
         before, after = await writer(*args)
+        upload = after.pop(MACHINE_UPLOAD, None)
     except DecaidUnreachable as exc:
         raise ToolError(f"waiting_for_tablet: {exc}") from exc
     except DecaidError as exc:
         raise ToolError(f"{exc.code}: {exc}") from exc
 
-    changes = {
-        name: {"before": before.get(name), "after": after.get(name)}
-        for name in payload
-    }
-    ignored = [n for n, pair in changes.items() if pair["before"] == pair["after"]]
+    changes, unchanged, not_taken = _outcome(payload, before, after)
 
     # Report what moved, not what was sent. A field can change without being
     # asked for - `set_workflow` carries the coffee labels along with a batch
@@ -882,12 +1246,15 @@ async def _write(
         extra={"fields": {
             "target": target_id or what,
             "wrote": ",".join(sorted(payload)),
-            "unchanged": ",".join(sorted(ignored)) or "-",
+            "unchanged": ",".join(sorted(unchanged)) or "-",
+            "not_taken": ",".join(sorted(not_taken)) or "-",
             "dur_ms": round((time.perf_counter() - started) * 1000, 1),
         }},
     )
 
     result: dict[str, Any] = {"changes": changes}
+    if upload is not None:
+        result["machine"] = upload
     if target_id is not None:
         result["id"] = target_id
     if alongside:
@@ -896,13 +1263,7 @@ async def _write(
             "These changed without being asked for, to keep the record "
             "consistent: " + ", ".join(alongside) + "."
         )
-    if ignored:
-        result["unchanged"] = ignored
-        result["note"] = (
-            "Decaid did not take these fields: " + ", ".join(ignored)
-            + ". Either the new value was identical to the old one, or the API "
-            "discarded it."
-        )
+    _report(result, unchanged, not_taken)
     return result
 
 
@@ -930,11 +1291,17 @@ def _register_update_shot(mcp: FastMCP, db: Database, coordinator: SyncCoordinat
         """Changes the note, rating or weights of a shot in Decaid.
 
         `fields` maps field name -> new value; `null` clears a field. Allowed:
-        espressoNotes, enjoyment (0-100), actualDoseWeight, actualYield (each in
-        g). Timestamps, telemetry and profile are not.
+        espressoNotes, enjoyment (tablet's scale), actualDoseWeight, actualYield
+        (each in g). Timestamps, telemetry and profile are not.
         """
+        scale = None
+        if isinstance(fields, dict) and fields.get("enjoyment") is not None:
+            try:
+                scale = await coordinator.enjoyment_scale()
+            except DecaidError as exc:
+                raise ToolError(f"{exc.code}: {exc}") from exc
         try:
-            payload = validate_fields(fields)
+            payload = validate_fields(fields, enjoyment_scale=scale or SCALE_100)
         except ValidationError as exc:
             raise ToolError("invalid_argument: " + "; ".join(exc.problems)) from exc
 
@@ -948,12 +1315,7 @@ def _register_update_shot(mcp: FastMCP, db: Database, coordinator: SyncCoordinat
         except DecaidError as exc:
             raise ToolError(f"{exc.code}: {exc}") from exc
 
-        changes = {
-            name: {"before": before.get(name), "after": after.get(name)}
-            for name in payload
-        }
-        ignored = [name for name, pair in changes.items()
-                   if pair["before"] == pair["after"]]
+        changes, unchanged, not_taken = _outcome(payload, before, after)
 
         # Field names yes, values no - notes can hold private things.
         log.info(
@@ -961,24 +1323,30 @@ def _register_update_shot(mcp: FastMCP, db: Database, coordinator: SyncCoordinat
             extra={"fields": {
                 "shot": id,
                 "wrote": ",".join(sorted(payload)),
-                "unchanged": ",".join(sorted(ignored)) or "-",
+                "unchanged": ",".join(sorted(unchanged)) or "-",
+                "not_taken": ",".join(sorted(not_taken)) or "-",
                 "dur_ms": round((time.perf_counter() - started) * 1000, 1),
             }},
         )
 
         result: dict[str, Any] = {"id": id, "changes": changes}
-        if ignored:
-            result["unchanged"] = ignored
-            result["note"] = (
-                "Decaid did not take these fields: "
-                + ", ".join(ignored)
-                + ". Either the new value was identical to the old one, or the "
-                "API discarded it."
-            )
+        if scale:
+            archived = await asyncio.to_thread(db.get_shot_row, id)
+            result["enjoyment"] = {"tablet_scale": scale,
+                                   "archived": archived["enjoyment"] if archived else None}
+        _report(result, unchanged, not_taken)
         return result
 
 
 # ------------------------------------------------------------------ Aufbereitung
+
+
+def _ambiguous_ratings(shots: list[dict[str, Any]]) -> dict[str, Any]:
+    """Ratings whose scale cannot be told (T46) - worth rating again."""
+    ids = [s["id"] for s in shots if s.get("enjoyment_ambiguous")]
+    if not ids:
+        return {}
+    return {"ambiguous_ratings": {"count": len(ids), "shots": ids[-10:]}}
 
 
 async def _refresh(coordinator: SyncCoordinator) -> dict[str, Any]:
@@ -1030,6 +1398,7 @@ def _compact_shot(row: Any, metrics: dict[str, Any] | None) -> dict[str, Any]:
         "duration_s": row["duration_s"],
         "peak_pressure_infusion": metrics.get("peak_pressure_infusion"),
         "enjoyment": row["enjoyment"],
+        **({"enjoyment_ambiguous": True} if row["enjoyment_ambiguous"] else {}),
         "notes": _short(row["notes"]),
         "warnings": len(metrics.get("warnings") or []),
     }
@@ -1054,8 +1423,18 @@ def _full_shot(row: Any) -> dict[str, Any]:
         "target_yield_g": row["target_yield_g"],
         "stop_reason": row["stop_reason"],
         "enjoyment": row["enjoyment"],
+        **({"enjoyment_ambiguous": True} if row["enjoyment_ambiguous"] else {}),
         "notes": row["notes"],
     }
+
+
+def _freeze_view(data: dict[str, Any]) -> dict[str, Any]:
+    """Where the freezer history comes from (T57), and every period in it."""
+    periods, source, _ = frozen_periods(data)
+    return {"freeze_source": source,
+            "frozen_periods": [{"from": start.isoformat(),
+                                "to": end.isoformat() if end else None}
+                               for start, end in periods] or None}
 
 
 def _batch_summary(row: Any, *, full: bool = False) -> dict[str, Any]:
@@ -1084,6 +1463,7 @@ def _batch_summary(row: Any, *, full: bool = False) -> dict[str, Any]:
             "best_before_date": data.get("best_before_date"),
             "frozen_since": data.get("freeze_date"),
             "thawed_on": data.get("unfreeze_date"),
+            **_freeze_view(data),
             "stock": _stock(data),
             "archived": bool(data.get("archived")),
         }
@@ -1532,6 +1912,7 @@ def _status_payload(config: Config, db: Database) -> dict[str, Any]:
             "url": config.decaid_url,
             "version": decaid_version,
             "verified_version": VERIFIED_DECAID_VERSION,
+            "enjoyment_scale": db.get_state(STATE_ENJOYMENT_SCALE),
             "last_reachable": last_reachable,
             "waiting_for_tablet": bool(last_result.get("waiting_for_tablet")),
         },
@@ -1598,7 +1979,7 @@ def build_app(
 
     coordinator = None
     if sync_on:
-        coordinator = SyncCoordinator(DecaidClient(config.decaid_url), database)
+        coordinator = SyncCoordinator(DecaidClient(config.decaid_url), database, config)
 
     mcp = build_mcp(config, database, coordinator)
     app = mcp.http_app(path=config.mcp_path, transport="http")

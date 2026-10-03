@@ -1,6 +1,6 @@
 # decentespresso-mcp — specification
 
-**Applies to version 0.9.0.** This document describes the system as it is, not
+**Applies to version 0.14.0.** This document describes the system as it is, not
 how it came to be. Where a decision still explains behaviour, the reasoning is
 kept; where it only explains history, it is gone.
 
@@ -58,9 +58,17 @@ normal state, not a fault: see §6.
 
 ## 4. The source: Decaid
 
-Verified against the running instance, Decaid **0.8.5+2624**. The constant
-`VERIFIED_DECAID_VERSION` in `decaid_client.py` holds that version; `status()`
-warns when the tablet reports a different one.
+Verified against the running instance, Decaid **0.8.6+2801** (2026-09-26). The
+constant `VERIFIED_DECAID_VERSION` in `decaid_client.py` holds that version;
+`status()` warns when the tablet reports a different one.
+
+The table below was built against Decaid 0.8.5+2624. When the tablet moved to
+Decaid 0.8.6 the findings this server leans on hardest were measured again, and
+one had changed: T4, T8, T9, T11, T12, T13, T16, T22 (creation), T32 and T34
+hold; **T10 changed** - `/shots/latest` no longer carries the measurements.
+T37-T41 are new, measured on Decaid 0.8.6. The rest (T14, T15, T17-T21,
+T23-T26, T28, T29, T33) was not re-probed; where the code depends on one of
+them it checks before it writes rather than trusting the table.
 
 **Verification is a duty, not a courtesy.** Every finding below was measured
 against the live API, and each one that shapes behaviour is noted at the
@@ -80,11 +88,13 @@ instance wins and the finding goes in the table above.
 | `GET /api/v1/info` | version, commit, build time |
 | `GET /api/v1/shots?limit=&offset=&order=` | everything except `measurements`, `updatedAt` included |
 | `GET /api/v1/shots/ids` | every id in one go, unpaginated |
-| `GET /api/v1/shots/latest` | the newest shot in full |
+| `GET /api/v1/shots/latest` | the newest shot, without measurements since Decaid 0.8.6 (T10) |
 | `GET /api/v1/shots/<id>` | one shot in full, including `measurements` |
 | `GET /api/v1/beans`, `GET /api/v1/bean-batches` | beans and batches, unpaginated |
 | `GET /api/v1/workflow` | the setting for the next shot, including the profile |
-| `PUT /api/v1/shots/<id>`, `/beans/<id>`, `/bean-batches/<id>`, `/workflow` | write paths, see §10 |
+| `PUT /api/v1/shots/<id>`, `/beans/<id>`, `/bean-batches/<id>`, `/workflow` | write paths, see §11 |
+| `POST /api/v1/beans`, `/beans/<id>/batches` | creation, 201 with the new record (T41) |
+| `GET/POST /api/v1/profiles`, `GET/PUT /profiles/<id>` | profile records with content-hash ids (T37) |
 
 ### 4.2 What the API actually does
 
@@ -99,7 +109,7 @@ instance wins and the finding goes in the table above.
 | T7 | Filters | `beanId` works. `profileId` is **ignored** |
 | T8 | Server-side time filter | **Does not exist.** `updated_after`, `since`, `sort` are silently ignored |
 | T9 | `/shots/ids` | All ids, unpaginated, as a flat array |
-| T10 | `/shots/latest` | Full detail including `measurements` |
+| T10 | `/shots/latest` | **Changed in Decaid 0.8.6:** everything except `measurements`; it was the full detail before. Nothing here reads the series from it |
 | T11 | `/shots/<id>` | Full detail |
 | T12 | `measurements` shape | `{machine{…}, scale{…}, volume}` per point. **No `time` field** - the axis comes from `machine.timestamp` minus the first. `profileFrame` sits under `machine` |
 | T13 | `PUT` semantics | Deep merge: sending one annotation leaves the others and all measurements untouched |
@@ -107,15 +117,15 @@ instance wins and the finding goes in the table above.
 | T15 | `updatedAt` | Set server-side on a content change; `createdAt` untouched |
 | T16 | Beans and batches | `/api/v1/bean-batches` or `/api/v1/beans/<id>/batches`; `/api/v1/batches` → 404. Single-item fetches **do** exist: `/api/v1/beans/<id>` and `/api/v1/bean-batches/<id>` both return 200 |
 | T17 | WebSocket | `/ws/v1/machine/shotState` → 101 Upgrade. `/ws/v1/machine/state` → 404 |
-| T18 | `enjoyment` scale | 0–100 as a float. No star scale |
+| T18 | `enjoyment` scale | 0–100 as a float up to 0.8.6. **Superseded by T46**: Decaid's own 0–10 from decaid#887 on |
 | T19 | Retention | No pruning endpoint; the archive reaches back without gaps |
 | T20 | Writable annotations | `espressoNotes`, `enjoyment`, `actualDoseWeight`, `actualYield` |
-| T21 | Writable on a bean | `name`, `roaster`, `species`, `processing`, `notes`, `decaf` |
+| T21 | Writable on a bean | `name`, `roaster`, `species`, `processing`, `notes`, `decaf`, and the origin fields of T31 |
 | T22 | Writable on a batch | `roastDate`, `buyDate`, `openDate`, `bestBeforeDate`, `freezeDate`, `unfreezeDate`, `frozen`, `weight`, `weightRemaining`, `roastLevel`, `harvestDate`, `qualityScore`, `price`, `currency`, `notes`. Dates come back with a time attached - the long-standing three with a trailing `Z`, the later ones without |
 | T23 | **`unfreezeDate`** | **Exists and is writable.** An earlier entry here said it did not exist; that was read off a response where it was unset, and an absent key is not an absent field. Written and read back 2026-09-16. With it the freezer time is subtracted exactly instead of the age becoming an upper bound |
-| T24 | Writable on the workflow | `context.grinderSetting`, `context.grinderModel`, `context.targetDoseWeight`, `context.targetYield`, `context.beanBatchId` |
+| T24 | Writable on the workflow | `context.grinderSetting`, `context.grinderModel`, `context.targetDoseWeight`, `context.targetYield`, `context.beanBatchId`, and `profile` as a whole object (T38) |
 | T25 | Protected on write | `id` → 400 ("ID in path does not match"), `createdAt`/`updatedAt` → 400 ("system-managed") |
-| T26 | **`timestamp`** | **Not protected.** A `PUT` carrying it returns 200 and the value stands |
+| T26 | **`timestamp`** | **Not protected.** A `PUT` carrying it returns 200 and the value stands. Rechecked on Decaid 0.8.6 (2026-09-26), with the original kept as an exact string this time and restored exactly |
 | T27 | **Weight on a batch** | **Exists and is in use.** `weight` and `weightRemaining` are writable, and the reference batch now carries 500 g. The earlier entry called them nonexistent on the strength of a response that omitted them while unset. See T34 for why only the first of the two can be trusted |
 | T28 | **Batch and coffee labels** | **Kept apart, and nothing joins them.** `context` holds the managed reference `beanBatchId` next to the display strings `coffeeName` and `coffeeRoaster`; setting the batch alone leaves the previous coffee's name standing on the machine. Measured live: after `beanBatchId` was moved to the decaf batch, `coffeeName` still read `Arabica Honey Process`. Decaid's own API examples write the id and both labels together |
 | T29 | **`beanBatchId` is unchecked** | An arbitrary UUID is accepted with 200 and stands afterwards. There is no referential integrity, so the client is the only thing between a typo and a workflow pointing at nothing |
@@ -126,6 +136,26 @@ instance wins and the finding goes in the table above.
 | T34 | **`weightRemaining` does not count down** | It is initialised to `weight` when the batch is created and nothing decrements it. On the reference batch it reads 500 g of a 500 g bag after 27 shots that consumed 486 g. A remainder worth having is derived from the recorded doses; Decaid's figure is reported beside it, never instead of it |
 | T35 | **`harvestDate` is not a date** | The API calls it "harvest date or season" and the real value is `"2026"`. Stored and validated as text - parsing it would either fail or invent a first of January |
 | T36 | **Future dates are legitimate** | `bestBeforeDate` lies ahead by nature, and the operator's `openDate` did too. A blanket "no future dates" rule refused both |
+| T37 | **A profile's id is its content** | `profile:<20 hex>`, hashed from the brewing-relevant fields; the title is not among them. A `PUT` that changes brewing content moves the record to a new id and the old id answers 404 - replaced, not kept alongside. `parentId` and `metadata` survive the move. Identical content gives the identical id on every creation: a probe and the acceptance run produced `profile:0291c850b4407417dd79` independently |
+| T38 | **The workflow embeds, it does not refer** | `workflow.profile` is a full profile object with no id anywhere in the workflow. Selecting a profile means copying it in; which record it came from can only be told by comparing content. A `PUT` carrying `profile` is accepted and leaves `context` untouched |
+| T39 | **A duplicate creation reports success** | A `POST /profiles` whose content already exists answers **201** with the *existing* record and silently drops the new title, `parentId` and `metadata`. Nothing is created. A client trusting the status code reports a new profile that is not there |
+| T40 | **Deleting a bean does not cascade** | `DELETE /beans/<id>` on a bean with batches fails with 500 (SQLite foreign key, code 787) although the API description says it deletes the batches too. Nothing is deleted. Batches first, then the bean. Not used by this server, which deletes nothing - found while cleaning up probes |
+| T41 | **Creation: required and returned** | `POST /beans` needs `name` and `roaster` (both refused alone with 400, a type-cast error rather than a message) - but **accepts both as empty strings** with 201, a bean with no name (measured, deleted) and returns 201 with the new id. `POST /beans/<id>/batches` needs nothing and sets `weightRemaining` from `weight`. `POST /profiles` returns 201 with the record, visible, not default. Titles are not length-limited by the API - 300 characters were taken |
+| T42 | **A DYE2 recipe can mislabel the coffee** *(history - the path it shaped was removed in 0.14)* | The live recipe "Decaf" stores `context.coffeeName` and neither `coffeeRoaster` nor `beanBatchId`. Applied as stored on a Grano Gayo batch, the machine showed "Coffee Circle / Sugar Cane Decaf". `apply_recipe` applies it unchanged, as the contract asks, and reports the mismatch |
+| T43 | *(withdrawn)* | Recorded on 2026-09-26 as "every DYE2 favourite carries a D-Flow stored nowhere". Wrong: the comparison hashed stubs without steps against each other. T44 is what the data shows |
+| T44 | **A DYE2 `workflow.profile` may be a name without a profile** *(history - the path it shaped was removed in 0.14)* | Seven of eight live favourites store `{"id": null, "title": "D-Flow"}`, one an id without steps - and Decaid drops a profile `id` sent to the workflow and does not resolve it (measured with a real id); the recipe stores no profile. PUT as stored, such a stub only renames the running profile (T13) - applying "Seniman House Blend" left the previously running tune brewing. Reported on apply; the unsaved-profile guard does not fire for it, because nothing is replaced |
+| T46 | **Ratings move to 0–10** (decaid#887, on main after 0.8.7-beta.1, in no release yet; read from the source 2026-09-26) | `annotations.enjoyment` becomes Decaid's own 0–10 field; `PUT /shots` refuses values outside it with 400, and that check runs **before** the shot is looked up. The schema-6 migration divides by ten every value over 10, and at 10 or below only an untouched de1app import (`id LIKE 'de1app-%'`, `created_at != timestamp`, `updated_at <= created_at`); it does **not** set `updated_at`. Everything else from 1 to 10 stays as it is - Decaid calls these ambiguous and does not guess. DYE2 moved to 0–10 with dye2#8 (0.1.15, stars ×2) and **already runs on the 0.8.6 tablet**, so new DYE2 ratings there are 0–10 inside a 0–100 field. Live, read-only: 88 imports, all `createdAt == timestamp`, so none untouched; two native shots at 4.0 and 5.0 (DYE2's raw star index before dye2#7). The probe - `PUT` of `enjoyment: 11` to a non-existent id - answers 404 "Shot not found" on 0.8.6+2801 and changes nothing |
+| T47 | **Profile upload to the DE1 has no completion signal in the API** (source v0.8.6 + live, 2026-09-27) | `PUT /workflow` answers once the workflow is stored. The upload runs afterwards in WorkflowDeviceSync - asynchronous, over Bluetooth, queued - and is **skipped silently** while the DE1 is not connected, then pushed on the next connect. A failed attempt raises `profileUploadFailed` (retries after 3, 10, 30 s), visible only in `connectionStatus.error` of the `/ws/v1/devices` socket - one slot, currently held by an older `scaleDisconnected` - and as a WARNING in the log. Success is reported nowhere in the API. It is visible in `/api/v1/logs`: the upload's last write logs `DE1 - mmr write: tankTemp` at INFO (the tablet logs at INFO; FINE lines such as "encoding step" are absent). Measured, DE1 connected and asleep: 0.79, 0.86, 0.87 and 0.92 s from the PUT to that line; in a day of log every profile PUT had one within about a second. A sleeping DE1 takes the upload |
+| T48 | **Two tablet clients write the workflow from their own state** *(history - the path it shaped was removed in 0.14)* (source DYE2 0.1.15 and streamline-js 6f2b914 on Decaid 0.8.6; log 2026-09-27) | DYE2's dashboard loads the workflow once when the page opens and never refreshes it; every edit there, and "Done", PUTs that whole copy back - context and profile - over whatever changed meanwhile. Streamline, on a profile switch, writes `targetDoseWeight`, `targetYield` and `grinderSetting` from the profile record's `metadata`, and `grinderSetting: null` when none is saved there; the batch it leaves alone. Both write from 127.0.0.1. The shot of 2026-09-27 08:33 (D-Flow, grind "3.50", Grano Gayo) followed such a local PUT by 2.1 s; "3.50" is Streamline's spelling (`toFixed(2)`), not DYE2's. Where the value came from is **not yet reproduced** - D-Flow's metadata holds "2.60" today |
+| T49 | **When a finished shot is not stored** (source v0.8.6, log 2026-09-26/27) | Three cases, only one of them logged: aborted during preheat, before preinfusion or pour ("Shot aborted" at INFO); `blockOnNoScale` without a scale; and a profile of `beverage_type` `cleaning` or `calibrate` **in the workflow when the shot ends** - dropped without a log line. The stored record takes the workflow of that moment too, not of the start. Across the log window (2026-09-26 16:00 to 2026-09-27 09:00) one run went unstored: 22:22, "Cleaning/Forward Flush x5", eight frames advanced - by design |
+| T50 | **Streamline clears the coffee from the workflow after every stored shot** *(history - the path it shaped was removed in 0.14)* (streamline-js source; log on Decaid 0.8.6, 2026-09-27) | `clearDyeWorkflowContext` sets `beanBatchId`, `coffeeName`, `coffeeRoaster`, grinder, barista, drinker and basket to null once a shot is persisted, so they do not label the next one - DYE2 is meant to restate them per shot. Measured: "Storing shot" 08:34:11.99 → `PUT /workflow` from 127.0.0.1 at 08:34:12.05; 12:47:27.68 → 12:47:27.76. Grind, dose, yield and profile stay. The context-lost finding of M12 (B) follows from this, not from a fault |
+| T51 | **Streamline's DYE strip: five recipes, applied from `workflow`, auto-saved into `dashboardVariables`** *(history - the path it shaped was removed in 0.14)* (streamline-js 6f2b914, on Decaid 0.8.6) | The strip shows the first five visible recipes in array order (`showOnStreamlineDashboard !== false`). Tapping one GETs the live workflow, merges `workflow.context` over it, takes `workflow.profile` whole, and PUTs. Its auto-save folds a later dashboard edit of dose, drink or grind into that recipe's `dashboardVariables` only - which its own apply never reads while a `workflow` is present, so on a DYE2 recipe the edit does not come back. Since streamline-js fe73b4a the auto-save stops when the workflow's profile no longer matches a fingerprint of the applied one (`JSON.stringify` of title, targets, tank temperature and the steps without temperature) - key order counts, so a projected profile must keep Decaid's own order, which is not alphabetical |
+| T52 | **DYE2's own dashboard ignores a recipe's `workflow`** *(history - the path it shaped was removed in 0.14)* (DYE2 0.1.15 source, on Decaid 0.8.6) | `applyRecipe` takes dose, drink and grind from `dashboardVariables` and sends the profile as `{id: profileId, title: profileTitle}` - a stub that renames the running profile and keeps its steps (T44). A recipe can change the profile with one tap only through Streamline's strip |
+| T53 | **DYE2's recipe editor keeps foreign items** *(history - the path it shaped was removed in 0.14)* (DYE2 0.1.15 source, on Decaid 0.8.6) | It shows five fixed slots, ids "1"-"5", but saves through `updateRecipe`: GET the array, upsert by id, POST. Items with other ids survive an edit in DYE2. The store's POST replaces the whole value and answers `{}` (decaid `kv_store_handler.dart`) |
+| T54 | **Only ids "1"-"5" exist for DYE2's editor and Streamline's long press** *(history - the path it shaped was removed in 0.14)* (reported by the operator 2026-09-28; streamline-js cc14749 and DYE2 0.1.15 source, on Decaid 0.8.6) | A projected recipe with the id `mcp-<bean>` showed in Streamline's strip but not in DYE2's "Describe your espresso" overview, which normalises the list to five slots with ids "1"-"5". Streamline's long press opens slot `parseInt(id) \|\| 1` - for `mcp-...` that is slot 1, the user's own Decaf. Our items therefore take DYE2's free slots |
+| T55 | **DYE2 cannot delete a recipe** *(history - the path it shaped was removed in 0.14)* (DYE2 0.1.15 and main, on Decaid 0.8.6) | "Clear all" in the recipe editor replaces the slot with `{}` in the page's state, which drops the id, and SAVE writes only `if (recipe && recipe.id)` - so a cleared slot is never saved and the stored recipe stays. A slot DYE2 holds is freed only by writing the list without it |
+| T57 | **Beanie keeps the freezer history in `extras.storageEvents`, and Decaid replaces `extras` whole** (Beanie a54a625 source; throwaway batch on Decaid 0.8.6+2801, 2026-09-28, deleted after) | Beanie writes `[{type: "frozen"\|"thawed", at: ISO}]` under the batch's `extras` (`gateway.ts` `toGatewayBatchBody`), sorted by time, and sets `frozen` - never `freezeDate`/`unfreezeDate` (upstream draft 14). Measured: the array round-trips through `GET /bean-batches/<id>` and the list; `frozen: true` alone leaves `freezeDate` null; a later `PUT` with `extras: {probe: 1}` **removed** `storageEvents` - unlike a shot's annotations (T13), `extras` is replaced, not merged. So bean age reads Decaid's fields where set, else the events, with every period summed; `get_batch` names the source (`freeze_source`) and the periods; `create_batch`/`update_batch` mirror a freeze or thaw into the events in Beanie's format (`toISOString()`, same type replaces the latest event's date, keeping its time of day) and send the rest of `extras` along as read |
+| T45 | **A bean id where a batch belongs** *(history - the path it shaped was removed in 0.14)* | Six of eight live DYE2 favourites store a bean's id as `beanBatchId` (404 as a batch, 200 as a bean). Decaid would take it (T29). Applying such a favourite is refused, naming the bean's batches |
 
 T26 is why the block list in `writes.py` is not a second line of defence but the
 only one for the telemetry fields.
@@ -166,7 +196,9 @@ server acted as if it were current.
 - **`raw_json`** holds the response **without** the measurements. Those live in
   `shot_series`; a detail response weighs about 140 kB with them, which across
   the archive would be a multiple of everything else, stored twice.
-- **`enjoyment`** is 0–100 or NULL. NULL means not rated. See §5.3.
+- **`enjoyment`** is 0–10 or NULL, whatever scale the tablet runs. NULL means
+  not rated. `enjoyment_ambiguous` marks a value whose scale cannot be told.
+  See §5.3 and §5.4.
 
 `shot_series` — one row per data point, `(shot_id, elapsed)` as the key.
 Carries the measured channels, the **target** channels
@@ -207,6 +239,41 @@ with a de1app identifier, a 0 is therefore archived as `NULL`.
 Without this rule, 75 phantom ratings would enter the archive and the guards in
 §9 would take them at face value. When **writing**, the rule does not apply:
 what the user explicitly sets to 0 is an input.
+
+### 5.4 Rating scale: the archive keeps Decaid's 0-10
+
+Decaid moves `enjoyment` from a pass-through of de1app's 0-100 to its own 0-10
+(T46). The archive takes 0-10 as canonical on either side of that change, so a
+rating means the same whenever it was read.
+
+**The scale is asked of the tablet, not inferred from its version.** Once per
+Decaid version, a `PUT` of `enjoyment: 11` goes to a shot id that cannot exist:
+with #887 the range check refuses it (400), before it the lookup does (404).
+Neither writes anything. The build number is only the fallback when the answer
+is neither: builds are numbered by commits on main, #887 is in every build from
+2836 on, but a build off another branch can carry that count without it.
+
+**Read from a 0-100 tablet, ratings are converted by Decaid's own rule**, so the
+archive holds before the update what the tablet will hold after it: over 10
+divided by ten, 10 and below only on an untouched import. What that rule leaves
+alone is kept as it is and marked `enjoyment_ambiguous`: a low 0-100 rating,
+DYE2's raw star index and a 0-10 write by today's DYE2 on a 0-100 tablet look
+identical. `stats` leaves those out of means and counts them; `audit_archive`
+lists them, so they can be rated again. Migration 005 converted the archive by
+the same rule.
+
+**Once the tablet is on 0-10, every archived shot's annotations are read again**,
+once, from the shot list. Decaid's migration does not move `updatedAt`, so the
+cursor of §6 would never see a value it changed. Where the archive's conversion
+predicted the result, nothing changes; where it did not, the tablet wins. A mark
+survives the switch as long as value and `updatedAt` stand - Decaid left such a
+value as it was - and goes when the shot is rated again.
+
+**Writing follows the tablet's scale.** `update_shot` takes `enjoyment` as
+Decaid will check it: 0-10 with one decimal after #887, whole numbers 0-100
+before - and there not 1 to 10, which Decaid's migration would keep and so read
+ten times higher afterwards. The answer reports the tablet's scale and the
+archived value.
 
 ## 6. Ingestion
 
@@ -523,7 +590,7 @@ is read-only except `sync_now` and the write tools from §11.
 | `get_shot(id \| "latest", bean?, include_curve, max_points)` | metadata, metrics, curve shape, profile summary |
 | `get_shot_metrics(id)` | the metrics alone |
 | `compare_shots(ids[2..4], include_profile, include_curves)` | side by side with deltas to the first and a divergence note |
-| `list_profiles()` | profiles with their versions |
+| `list_profiles(on_tablet?)` | profiles the shots ran on, with versions; `on_tablet` lists the tablet's records live, with the ids the profile tools take |
 | `get_profile(shot_id? \| name? \| version_hash?)` | the complete targets |
 | `get_workflow()` | the setting for the next shot, live from the tablet |
 | `sync_now()` | an immediate sync, idempotent |
@@ -532,6 +599,7 @@ is read-only except `sync_now` and the write tools from §11.
 | `list_batches(bean?)` | batches with roast date and usage - where batch identifiers come from |
 | `get_batch(id)` | one batch in full: all dates, freezer state, weights |
 | `stats(period, compare_previous)` | what was pulled in a period, and how it tasted |
+| `list_recipes(source?)` | saved recipes - mine, DYE2's, or both - in one shape |
 
 Filters are case-insensitive substrings. Dates take ISO8601 or a relative
 shorthand (`12h`, `7d`, `2w`, `1m`, `1y`).
@@ -731,23 +799,31 @@ carries on; only delivered messages count as reported.
 
 ## 11. Writing
 
-Four tools, each behind `WRITE_ENABLED` and each with its own whitelist. When
+Thirteen tools, each behind `WRITE_ENABLED` and each with its own whitelist. When
 the switch is off the tools are **not registered** - they do not appear in the
 tool list and do not refuse. A tool that exists and refuses invites asking
 again; one that does not exist does not.
 
 | Tool | Fields |
 |---|---|
-| `update_shot` | `espressoNotes`, `enjoyment` (0–100), `actualDoseWeight`, `actualYield` |
-| `update_bean` | `name`, `roaster`, `species`, `processing`, `notes`, `decaf` |
-| `update_batch` | `roastDate`, `buyDate`, `freezeDate`, `frozen` |
-| `set_workflow` | `grinderSetting`, `grinderModel`, `targetDoseWeight`, `targetYield`, `beanBatchId` |
+| `update_shot` | `espressoNotes`, `enjoyment` (tablet's scale, §5.4), `actualDoseWeight`, `actualYield` |
+| `update_bean`, `create_bean` | T21 and T31; `name` and `roaster` required to create |
+| `update_batch`, `create_batch` | T22 |
+| `set_workflow` | `grinderSetting`, `grinderModel`, `targetDoseWeight`, `targetYield`, `beanBatchId`, `profileId` |
+| `clone_profile`, `update_profile` | the three overrides of §11.5, nothing else |
+| `save_workflow_profile`, `apply_recipe` | §11.6 - a bean's recipe is its most recent real shot |
+
+The docstrings do not repeat the field lists: they drifted - `update_batch` went
+on telling every request that Decaid keeps no thaw date for ten days after T23
+had been corrected everywhere else. A wrong field is refused with the full list
+of allowed ones, and that list is generated from the whitelist itself.
 
 **A field goes on a whitelist only after it was written against the real API and
 read back.** Better one field too few than one that gets discarded silently.
 
-**No profile change in v1.** It changes brewing behaviour fundamentally and
-belongs at the machine.
+**A profile is never taken from the caller as an object.** Selection goes by
+reference (`profileId`), change goes through the overrides of §11.5. An object
+would be whatever the caller typed, and Decaid runs whatever it is given.
 
 **Nothing is ever deleted.** The API can do it; this does not build it.
 
@@ -789,7 +865,7 @@ Consequences that follow from it:
 
 Before the first API call, with every violation collected. The API validates no
 value ranges at all, so this is the only protection against a typo reaching the
-archive. Weights are bounded, ratings are whole numbers 0–100, dates are ISO and
+archive. Weights are bounded, ratings follow the tablet's scale (§5.4), dates are ISO and
 not in the future, free text is capped.
 
 Decimal commas are accepted (`"18,5"` → `18.5`). For roast dates the error
@@ -801,6 +877,153 @@ machine-readable format is worth more than uniformity with an ambiguous one.
 
 One line per write with the target, the **field names** and the duration - no
 values. Notes can hold private things and a log is the wrong place for them.
+
+### 11.5 Coffee onboarding and the profile forge
+
+A new bag, set up for the machine, in four steps the model runs one at a time
+with the user's confirmation between them: `create_bean` → `create_batch` →
+`clone_profile` → `set_workflow`. There is deliberately no single tool doing
+all four. A combined call either succeeds whole or leaves the user to work out
+which part did not; four confirmed steps make each change visible as it
+happens, and a failure stops the flow at the step that failed. The order and the
+rule "stop, never skip" are in `INSTRUCTIONS`.
+
+**Favourites are per-coffee profiles plus the workflow.** Decaid's own
+favourites store (the DYE2 key-value store) is not written from here.
+
+**Creating is never retried.** Reads and updates are retried on 5xx and network
+errors; a `POST` is sent exactly once. A request the tablet acted on before it
+failed to answer would otherwise create a second bean, and the message on such
+a failure says the thing may exist anyway.
+
+**A duplicate bean is refused before sending.** Same name and roaster, compared
+case- and whitespace-insensitively, is the same coffee; the refusal names the
+existing one. Verified live: "probe-m10" / "PROBE-M10  Roaster" was caught
+against "PROBE-M10" / "PROBE-M10 Roaster".
+
+**What a clone may change** - three overrides, each verified by writing it and
+reading it back on the live instance, and nothing else:
+
+| Override | Sets | Limits |
+|---|---|---|
+| `temperature_c` | the main step to this value, every other step shifted by the same amount | 80–96 °C for **every** resulting step |
+| `target_weight_g` | stop-at-weight | 10–100 g |
+| `main_setpoint` | pressure or flow of the main step | ≤ 10 bar, ≤ 8 ml/s |
+
+The **main step** is the last step, provided it is also the longest - the pour,
+in every profile where the question has an obvious answer. Where it has none
+(Blooming Espresso ends on a 1 s reset step at zero flow) `main_setpoint` is
+refused, and so is `temperature_c` on a temperature curve with no anchor.
+
+The temperature is **shifted, not flattened**. A first version set every step to
+one value and refused any profile whose steps differed. The live instance showed
+why that was wrong: the operator's D-Flow fills at 88.5 and pours at 88.0 -
+D-Flow's editor has separate fill and pour temperatures - and the rule would
+have refused the very profile the acceptance was built on. Shifted, a clone at
+91.5 °C pours at 91.5 and fills at 92.0, and the half degree survives. Because
+every shifted step is a value written here, every one is bounded: Adaptive v3 at
+92 °C would fill at 97 and is refused.
+
+**A copy must brew differently.** Decaid's id is the content (T37). A copy that
+differs only in title is the original to Decaid, and it answers the `POST` with
+201 and the original's record (T39) - so a naive clone reports success for
+something that never happened. Refused before sending, as is a copy whose
+content matches any existing record (that one is named instead).
+
+**Titles.** Default `"<roaster> – <bean>"` with an en dash, taken from `bean_id`.
+A taken title - compared case-insensitively against every profile not deleted -
+is refused with a free one suggested. Sixty characters at most: Decaid took 300
+without complaint, so the limit is readability on the tablet, not an API rule.
+
+**By title means the visible one.** Every edit on the tablet leaves the
+previous version behind as a hidden record with the same title; the live
+instance holds four "D-Flow"s. A title resolves to the visible one; an id finds
+any record that is not deleted.
+
+**What `update_profile` will not touch.** A bundled default, ever - Decaid
+refuses that itself (400, verified), and this refuses it earlier with a reason.
+A profile not made by `clone_profile` (recognised by a marker in its metadata,
+which survives the id change of T37) only with `allow_foreign`, set when the
+user named that profile. The id changes with the content; the response names
+the new one and says whether the workflow is still running the old version - it
+holds a copy (T38), so it does not follow.
+
+**Selecting a profile.** `set_workflow` takes `profileId` (an id or exact
+title), resolves it against the tablet and copies the profile in. Unknown
+references are refused; Decaid would take any object at all. A profile change
+overwrites the workflow without asking. Until M13 a profile that existed only
+in the workflow - a tablet tune - was protected and needed
+`replace_unsaved_profile`; that made every profile change a two-step
+conversation. A tune is still in every shot pulled with it; to come back as a
+recipe it needs a title of its own (`save_workflow_profile`), because a recipe
+takes the stored profile of the shot's title (§11.6). `get_workflow` says
+whether the running profile is stored (`profile_stored`), for information only.
+
+**Visible on the tablet** is what the API says (`visibility: visible`). Whether
+the tablet's UI shows it in the list it shows is not something the API can
+answer; the acceptance run confirmed the flag, not the pixels.
+
+### 11.7 A profile change is confirmed at the machine
+
+A workflow write that changes the profile is not finished when Decaid
+answers: the profile still has to reach the DE1 over Bluetooth (T47). A shot
+started in between runs the old profile, and its record still names the new
+one, because Decaid stores the workflow of the moment the shot ends (T49).
+
+So `set_workflow` and `apply_recipe` watch for it whenever the profile they
+send differs from the running one - a new title included, since Decaid
+re-uploads on any change:
+
+- **Before the PUT** the DE1's connection is read from `/api/v1/devices`, and
+  the tablet's clock from the newest log line. With the DE1 not connected
+  nothing is waited for: `pending_connection`, Decaid uploads on connect.
+- **After it** the log is read every 0.5 s, 6 s at most. The first
+  `mmr write: tankTemp` after this server's `PUT /api/v1/workflow` line is
+  `confirmed`, with the seconds between; a `setProfile failed` WARNING is
+  `failed_retrying`. Neither in time: `unconfirmed`.
+
+The answer carries it as `machine`, with a note for anything but `confirmed`
+that says not to start the shot until the tablet shows the new curve. A second
+client uploading in the same second cannot be told apart in the log; the
+first upload after our PUT is taken. A log at WARNING level, or none, leaves
+every change `unconfirmed` - the safe side.
+
+### 11.6 Recipes
+
+**A recipe is a bean's most recent real shot** - the same thing Beanie restores
+with a tap. Nothing is stored or named; `list_recipes` derives it from the
+archive, `apply_recipe(bean)` puts it on the machine. The rule is Beanie's own
+(github.com/giladger/Beanie at a54a625, `beanWorkflowController.ts` and
+`beanWorkflow.ts`), so the chat and the tablet set the machine the same way:
+
+- **The shot**: the bean's newest shot that is not a service shot - steam,
+  water, flush, cleaning, calibration, by the profile's `beverage_type` or the
+  context's `finalBeverageType`.
+- **The batch**: the bean's newest usable batch by roast date, *not the
+  shot's* - usable meaning not under 5 g remaining; if none is, the newest.
+- **Dose and yield as planned** - the shot's `targetDoseWeight`/`targetYield`,
+  the measured value only where the plan has none; `targetYield` 0 when the
+  profile turns the weight stop off.
+- **The profile**: the stored profile of the shot's title where one exists,
+  otherwise the one the shot embeds, at the shot's brew temperature either
+  way. So a tablet tune saved under a stock title comes back as the stock
+  profile at that temperature - Beanie's behaviour, matched rather than
+  improved on.
+- **Context** as Beanie writes it: `beanId`, labels, batch, grinder id, model
+  and setting, `finalBeverageType: espresso`.
+
+Applying goes through the one workflow path (`_apply`): batch labels (T28) and
+the upload watch (§11.7). A bean without a real shot is answered with
+`no_recipe` and a pointer to `set_workflow`. A change made in the chat but not
+brewed yet lives in the workflow until the next shot.
+
+**History.** 0.11-0.13 kept recipes of their own - named and pinned, later one
+per bean derived from every write - and from 0.13 projected them into DYE2's
+recipe list for Streamline's strip. Beanie uses neither DYE2's list nor
+Streamline's strip, so 0.14 removed all of it: the projection, DYE2's recipes
+and favourites as sources, and the stored recipes (migration 007). The server
+never writes the plugin store; DYE2's KV contract is kept again in full. The
+tag `v0.13-last-streamline` marks the last state with that path.
 
 ## 12. Security
 

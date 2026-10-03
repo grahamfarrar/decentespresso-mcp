@@ -96,21 +96,40 @@ period before.
 You:    How was the last month?
 
 Claude: 117 shots in 30 days, just under four a day, with 13 flushes and aborts
-        left out. You rated 18 of them, averaging 53. Typical shot: 17.9 g in,
+        left out. You rated 18 of them, averaging 5.3 out of 10. Typical shot: 17.9 g in,
         38.4 g out, 1:2.1 in 29 seconds.
 
         The incahuasi accounts for 57 of those and you moved the grinder eleven
-        times on it — 4.3 down to 2.5, then settling around 2.7. It averages 47
-        across nine ratings, while the Arabica Honey Process sits at 67 across
+        times on it — 4.3 down to 2.5, then settling around 2.7. It averages 4.7
+        across nine ratings, while the Arabica Honey Process sits at 6.7 across
         four. That is the one to keep.
 
         Busiest day was 28 August: 34 pulls, 27 of them coffee.
 ```
 
-**Writing back, by asking.** "Give that one a 90 and note it was the best this
-week." Behind a switch that is off by default, with a whitelist of fields
+**Writing back, by asking.** "Give that one four and a half stars and note it was
+the best this week." Behind a switch that is off by default, with a whitelist of fields
 verified against the real API, and every change read back before it is reported
 to you.
+
+**A new bag, set up in four steps.** "I've got a new bag of Grano Gayo from
+Coffee Circle - set it up like my D-Flow, but at 91.5 and stop at 40 g." Bean,
+batch, a copy of the profile named after the coffee, and the machine pointed at
+both - each step shown and confirmed before the next, and stopped at the first
+one that fails. Favorites live as per-coffee profiles: tune the copy as the bag
+ages, and the stock profiles stay exactly as Decent shipped them.
+
+**A recipe is a bean's most recent real shot** - the same thing Beanie restores
+with a tap. "Back to the Grano Gayo" puts the machine where that bean's last
+real shot was: its newest batch, the grind, the planned dose and yield, and the
+profile. Nothing to save or name. A change made in the chat but not brewed yet
+lives in the workflow until the next shot.
+
+Running Streamline with DYE2 instead? 0.13 wrote one recipe per bean into
+DYE2's recipe list for Streamline's strip. That path is gone since 0.14 - this
+server never writes the plugin store and keeps DYE2's contract in full - but it
+lives on in the history: the tag `v0.13-last-streamline` is the last state
+with it.
 
 ---
 
@@ -171,7 +190,7 @@ state, not an error, and nothing will nag you about it.
 ## Requirements
 
 - A **Decent DE1** running **Decaid**, reachable on your network. Everything
-  here is verified against Decaid 0.8.5+2624 — twenty-seven findings about what
+  here is verified against Decaid 0.8.6+2801 — forty-one findings about what
   its API really does are tabulated in the specification, and `status()` says so
   when the version it meets differs from the one this was checked against.
 - **Docker** on a machine on the same network as the tablet.
@@ -255,9 +274,11 @@ inside tracebacks from libraries that know nothing about it.
 | `stats` | a period, with a comparison |
 | `sync_now` · `status` | housekeeping |
 | `update_shot` · `update_bean` · `update_batch` · `set_workflow` | writing, behind the switch |
+| `create_bean` · `create_batch` · `clone_profile` · `update_profile` | a new coffee and its profile, behind the switch |
+| `list_recipes` · `apply_recipe` · `save_workflow_profile` | recipes - listing always, the rest behind the switch |
 
-Fourteen tools cost 9.9 kB of definitions, eighteen with write mode on cost
-12.6 kB — about 700 B each, because the shared vocabulary lives in the server
+Fifteen tools cost about 10 kB of definitions, twenty-eight with write mode on
+cost 19.5 kB — about 700 B each, because the shared vocabulary lives in the server
 prompt rather than being repeated in every docstring. That budget is pinned by
 tests; it is meant to stay that way.
 
@@ -311,8 +332,10 @@ an error, just nothing to fetch.
 - **Imported shots know less.** Anything de1app recorded lacks the machine's
   phase markers, so its preinfusion boundary is inferred instead of read off.
   The metric says which, per shot, and refuses comparisons it cannot support.
-- **It does not write profiles.** Reading and versioning them, yes; changing
-  them belongs at the machine.
+- **It changes three things about a profile, on copies only.** Temperature,
+  stop-at-weight and the pour's setpoint - the three whose effect was verified
+  on the machine. Everything else about a profile belongs in the tablet's
+  editor, and Decent's bundled profiles are never touched.
 - **Nothing is ever deleted.** The API can do it. This project does not build
   it.
 

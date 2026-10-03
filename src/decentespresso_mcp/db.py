@@ -59,7 +59,7 @@ _SHOT_COLUMNS = (
     "bean_batch_id", "bean_id", "bean_name", "bean_roaster", "basket_name",
     "grinder_model", "grinder_setting",
     "target_dose_g", "target_yield_g", "dose_g", "yield_g", "ratio",
-    "enjoyment", "notes", "raw_json", "synced_at",
+    "enjoyment", "enjoyment_ambiguous", "notes", "raw_json", "synced_at",
 )
 
 _BEAN_COLUMNS = (
@@ -73,7 +73,7 @@ _BATCH_COLUMNS = (
     "freeze_date", "unfreeze_date", "frozen", "archived",
     "weight_g", "weight_remaining_g",
     "roast_level", "harvest_date", "quality_score", "price", "currency", "notes",
-    "created_at", "updated_at", "raw_json", "synced_at",
+    "storage_events", "created_at", "updated_at", "raw_json", "synced_at",
 )
 
 
@@ -221,6 +221,34 @@ class Database:
             self._conn.commit()
             return is_new
 
+    def annotation_rows(self) -> dict[str, dict[str, Any]]:
+        """Per shot the annotation columns, to compare a re-read against."""
+        with self._lock:
+            return {row["id"]: dict(row) for row in self._conn.execute(
+                "SELECT id, dose_g, yield_g, ratio, enjoyment, enjoyment_ambiguous, "
+                "       notes, updated_at FROM shots"
+            )}
+
+    def update_annotations(self, rows: Sequence[dict[str, Any]]) -> int:
+        """Overwrite annotation columns and the stored response; series untouched.
+
+        For a re-read from the shot list, which carries annotations but no
+        measurements (T46). Metrics are dropped where dose or yield moved.
+        """
+        with self._lock:
+            for row in rows:
+                self._conn.execute(
+                    "UPDATE shots SET dose_g = :dose_g, yield_g = :yield_g, "
+                    "ratio = :ratio, enjoyment = :enjoyment, "
+                    "enjoyment_ambiguous = :enjoyment_ambiguous, notes = :notes, "
+                    "raw_json = :raw_json, synced_at = :synced_at WHERE id = :id", row,
+                )
+                if row.get("weights_changed"):
+                    self._conn.execute("DELETE FROM shot_metrics WHERE shot_id = ?",
+                                       (row["id"],))
+            self._conn.commit()
+        return len(rows)
+
     # -------------------------------------------------- Beans and batches
 
     def upsert_beans(self, beans: Sequence[dict[str, Any]]) -> int:
@@ -268,8 +296,9 @@ class Database:
         params = [since] if since else []
         with self._lock:
             return [dict(row) for row in self._conn.execute(
-                f"SELECT id, started_at, bean_id, bean_batch_id, grinder_setting, "
-                f"       dose_g, target_dose_g, yield_g, target_yield_g, enjoyment "
+                f"SELECT id, started_at, bean_id, bean_batch_id, grinder_setting, profile_name, "
+                f"       dose_g, target_dose_g, yield_g, target_yield_g, enjoyment, "
+                f"       enjoyment_ambiguous "
                 f"FROM shots {clause} ORDER BY started_at ASC", params,
             )]
 
@@ -284,7 +313,7 @@ class Database:
             return [dict(row) for row in self._conn.execute(
                 "SELECT id, started_at, bean_name, bean_id, bean_batch_id, "
                 "       profile_name, grinder_setting, dose_g, yield_g, ratio, "
-                "       duration_s, enjoyment "
+                "       duration_s, enjoyment, enjoyment_ambiguous "
                 "FROM shots WHERE started_at >= ? AND started_at < ? "
                 "ORDER BY started_at ASC", (since, until),
             )]
@@ -333,6 +362,34 @@ class Database:
                 "SELECT MIN(started_at) AS lo, MAX(started_at) AS hi FROM shots"
             ).fetchone()
             return row["lo"], row["hi"]
+
+    # -------------------------------------------------------------- Recipes
+
+    def beans(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(r) for r in self._conn.execute(
+                "SELECT id, name, roaster FROM beans")]
+
+    def bean_shots(self, bean_id: str | None = None, limit: int = 24) -> list[dict[str, Any]]:
+        """Stored shot responses, newest first - what a recipe is read from.
+
+        24 per bean, as many as Beanie's picker loads (shotFilterForBean).
+        Without a bean, every bean's newest shots, for the listing.
+        """
+        clause, params = ("WHERE bean_id = ?", [bean_id]) if bean_id else (
+            "WHERE bean_id IS NOT NULL", [])
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT bean_id, raw_json FROM shots {clause} "
+                f"ORDER BY started_at DESC", params).fetchall()
+        out: dict[str, list[dict[str, Any]]] = {}
+        for row in rows:
+            kept = out.setdefault(row["bean_id"], [])
+            if len(kept) < limit:
+                kept.append(json.loads(row["raw_json"]))
+        if bean_id:
+            return out.get(bean_id, [])
+        return [shot for shots in out.values() for shot in shots]
 
     # -------------------------------------------------------------- Queries
 
