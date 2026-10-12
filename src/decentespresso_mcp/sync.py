@@ -356,8 +356,9 @@ async def _sync_beans(client: DecaidClient, db: Database, result: SyncResult) ->
     """
     scale = await enjoyment_scale(client, db)
     synced_at = utc_now_iso()
-    beans = [bean_row_from_decaid(b, synced_at) for b in await client.beans()]
-    batches = [batch_row_from_decaid(b, synced_at) for b in await client.bean_batches()]
+    # Archived ones too: the default lists leave them out, so an archived bag would stay active here for good.
+    beans = [bean_row_from_decaid(b, synced_at) for b in await client.beans(include_archived=True)]
+    batches = [batch_row_from_decaid(b, synced_at) for b in await client.bean_batches(include_archived=True)]
     if beans:
         result.beans = await asyncio.to_thread(db.upsert_beans, beans)
     if batches:

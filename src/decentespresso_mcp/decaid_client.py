@@ -268,18 +268,19 @@ class DecaidClient:
 
     # --- Beans and batches (T16) --------------------------------------------
 
-    async def beans(self) -> list[dict[str, Any]]:
-        """``GET /api/v1/beans``."""
-        return list((await self._request("GET", "/api/v1/beans")).json())
+    async def beans(self, include_archived: bool = False) -> list[dict[str, Any]]:
+        """``GET /api/v1/beans``. Decaid leaves archived beans out unless asked."""
+        path = "/api/v1/beans" + ("?includeArchived=true" if include_archived else "")
+        return list((await self._request("GET", path)).json())
 
-    async def bean_batches(self, bean_id: str | None = None) -> list[dict[str, Any]]:
+    async def bean_batches(self, bean_id: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         """``GET /api/v1/bean-batches``, or the batches of one bean.
 
         The path ``/api/v1/batches`` named in the brief does not exist (T16).
         """
         path = (
             f"/api/v1/beans/{bean_id}/batches" if bean_id else "/api/v1/bean-batches"
-        )
+        ) + ("?includeArchived=true" if include_archived else "")
         return list((await self._request("GET", path)).json())
 
     async def update_bean(self, bean_id: str, patch: dict[str, Any]) -> dict[str, Any]:

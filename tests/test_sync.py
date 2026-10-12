@@ -70,11 +70,11 @@ class FakeDecaid:
         self._check()
         return self.rates_on_ten
 
-    async def beans(self):
+    async def beans(self, include_archived=False):
         self._check()
         return load("beans.json")
 
-    async def bean_batches(self, bean_id=None):
+    async def bean_batches(self, bean_id=None, include_archived=False):
         self._check()
         return load("bean_batches.json")
 
